@@ -13,7 +13,13 @@ const { ProxyAgent } = require('undici');
 
 const SB_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SB_KEY = process.env.SUPABASE_KEY || '';
-const PRIV_PEM = String(process.env.BO_PRIVATE_KEY || '').replace(/\\n/g, '\n').trim();
+// อ่านกุญแจลับ: จากไฟล์ก่อน (เลี่ยงปัญหา systemd ตัด \n ของค่ายาว) แล้วค่อย fallback เป็น env
+const PRIV_PEM = (function () {
+  const fsx = require('fs'), px = require('path');
+  const f = process.env.BO_PRIVATE_KEY_FILE || px.join(__dirname, 'bo_key.pem');
+  try { if (fsx.existsSync(f)) { const t = fsx.readFileSync(f, 'utf8').trim(); if (t) return t; } } catch (e) {}
+  return String(process.env.BO_PRIVATE_KEY || '').replace(/\\n/g, '\n').trim();
+})();
 const PROXY_URL = String(process.env.PROXY_URL || '').trim(); // เช่น socks5h://127.0.0.1:1080
 
 const LOOP_MS = 2 * 1000;        // เช็กคิวงานทุก 2 วินาที
