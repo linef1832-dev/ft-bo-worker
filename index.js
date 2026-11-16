@@ -320,7 +320,8 @@ const K36 = {
       code: raw.thirdpartypaymentcode,
       name: (raw.thirdpartypaymentdisplayname && raw.thirdpartypaymentdisplayname['th-TH']) || '',
       currency: cur.currency || 'THB',
-      status: cur.status,                    // ค่าสถานะดิบ (บอทส่งคืนเหมือนเดิมถ้าไม่สั่งแก้)
+      status: cur.status,                    // สถานะฝาก (การรับชำระเงิน): 1=เปิด 2=สำรอง 4=ปิดการใช้งาน 8=ปิด
+      supportpayout: (cur.supportpayout !== false),   // สถานะถอน: true=เปิด false=ปิด
       readonly: { updatedby: cur.updatedby, updatedat: cur.updatedat },
       values: {
         maxdailyamt: String(cur.maxdailyamt ?? ''),
@@ -361,8 +362,12 @@ const K36 = {
 
     if (changes.status !== undefined) {
       const st = Number(changes.status);
-      if (![0, 1, 2, 3].includes(st)) throw new Error('สถานะไม่ถูกต้อง');
-      if (cur.status !== st) { cur.status = st; changed.push('สถานะ=' + st); }
+      if (![1, 2, 4, 8].includes(st)) throw new Error('สถานะฝากไม่ถูกต้อง');   // 1=เปิด 2=สำรอง 4=ปิดการใช้งาน 8=ปิด
+      if (cur.status !== st) { cur.status = st; changed.push('สถานะฝาก=' + st); }
+    }
+    if (changes.supportpayout !== undefined) {
+      const b = !!changes.supportpayout;   // true=เปิดถอน false=ปิดถอน
+      if (cur.supportpayout !== b) { cur.supportpayout = b; changed.push('สถานะถอน=' + (b ? 'เปิด' : 'ปิด')); }
     }
     for (const k of ['maxdailyamt', 'maxtotalamt', 'minpayoutamt', 'maxpayoutamt']) {
       if (changes[k] !== undefined) {
