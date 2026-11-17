@@ -593,15 +593,22 @@ async function fastLoop() {
   try {
     const rows = await sb('GET', 'bo_tasks?status=eq.queued&select=site_id&limit=20');
     if (rows && rows.length) {
-      const siteIds = [...new Set(rows.map(r => r.site_id))];
-      for (const sid of siteIds) {
-        const s = sessions.get(sid);
-        const site = fastSiteCache.get(sid);
-        if (!s || !s.token || !site) continue; // ยังไม่ล็อกอิน → ปล่อยให้ loop หลักจัดการ
-        try {
-          await processTasks(site, s.token);
-        } catch (e) { log('⚠️ fast', sid, e.message); }
-      }
+      // เว็บที่ล็อกอินแล้วเท่านั้น (ที่ยังไม่ล็อกอินปล่อยให้ loop หลักจัดการ)
+      const siteIds = [...new Set(rows.map(r => r.site_id))].filter(sid => {
+        const s = sessions.get(sid); return s && s.token && fastSiteCache.get(sid);
+      });
+      // ประมวลผลหลายเว็บ "พร้อมกัน" ทีละ 4 (แต่ละเว็บคนละ session/หลังบ้าน จึงขนานได้)
+      const CONC = 4;
+      let i = 0;
+      const worker = async () => {
+        while (i < siteIds.length) {
+          const sid = siteIds[i++];
+          const s = sessions.get(sid), site = fastSiteCache.get(sid);
+          if (!s || !s.token || !site) continue;
+          try { await processTasks(site, s.token); } catch (e) { log('⚠️ fast', sid, e.message); }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONC, siteIds.length) }, worker));
     }
   } catch (e) {
     // เงียบไว้ ไม่ log รัว ๆ
