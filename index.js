@@ -270,6 +270,29 @@ async function boApi(site, token, method, path, body, _retried) {
 // งานช่องทางชำระเงิน: list / get / save
 // ========================================================
 const VALID_PAYTYPES = ['QR_BANK', 'PROMPTPAY', 'TRUEMONEY', 'DEBIT_CARD', 'USDT'];
+
+// ดึงค่าดิบของช่องทาง: ลอง THB ก่อน ถ้าพังแบบ 499/UNHANDLED (ชั่วคราว) รอแล้วลองสกุลเดิมซ้ำ 1 ครั้ง
+// แล้วค่อยลอง USDT ให้; error อื่น (เช่น token) โยนทันที ไม่ไล่สกุลต่อ  — ใช้ร่วมทั้ง get/save (กันเขียนซ้ำ)
+async function getRawChannel(site, token, channelId) {
+  const cid = encodeURIComponent(channelId);
+  let raw, lastErr;
+  for (const c of CURRENCIES) {
+    let got = false;
+    for (let attempt = 0; attempt < 2 && !got; attempt++) {
+      try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; got = true; }
+      catch (e) {
+        lastErr = e;
+        const retriable = (e.httpStatus === 499 || /UNHANDLED_EXCEPTION/i.test(e.message || ''));
+        if (!retriable) throw e;
+        if (attempt === 0) await new Promise(r => setTimeout(r, 400));
+      }
+    }
+    if (got) break;
+  }
+  if (raw === undefined) throw lastErr;
+  return raw;
+}
+
 const K36 = {
   // ดึงรายชื่อช่องทางทั้งหมด
   async listChannels(site, token) {
@@ -286,22 +309,7 @@ const K36 = {
   // ดึงค่าปัจจุบันของช่องทาง (ค่าดิบ + ค่าที่แก้ได้แบบย่อ)
   // บางช่องเป็นสกุล USDT ไม่ใช่ THB → ขอ /THB ก่อน ถ้าพัง (499/UNHANDLED) ลอง /USDT
   async getChannel(site, token, channelId) {
-    const cid = encodeURIComponent(channelId);
-    let raw, lastErr;
-    for (const c of CURRENCIES) {
-      let got = false;
-      for (let attempt = 0; attempt < 2 && !got; attempt++) {   // 499 ชั่วคราว → รอแล้วลองสกุลเดิมซ้ำอีก 1 ครั้ง
-        try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; got = true; }
-        catch (e) {
-          lastErr = e;
-          const retriable = (e.httpStatus === 499 || /UNHANDLED_EXCEPTION/i.test(e.message || ''));
-          if (retriable === false) throw e;
-          if (attempt === 0) await new Promise(r => setTimeout(r, 400));
-        }
-      }
-      if (got) break;
-    }
-    if (raw === undefined) throw lastErr;
+    const raw = await getRawChannel(site, token, channelId);
     const cur = (raw.currencies && (raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0])) || {};
     const pts = cur.paymenttypesetting || {};
     const enabled = Array.isArray(cur.depositPaymentTypes) ? cur.depositPaymentTypes : Object.keys(pts);
@@ -348,19 +356,9 @@ const K36 = {
   // changes = { status?, maxdailyamt?, maxtotalamt?, minpayoutamt?, maxpayoutamt?,
   //             amountsuggest?, suggestamounts?, types?: {CODE:{enabled?,min?,max?}} }
   async saveChannel(site, token, channelId, changes) {
-    const cid = encodeURIComponent(channelId);
-    let raw, lastErr;
-    for (const c of CURRENCIES) {
-      let got = false;
-      for (let attempt = 0; attempt < 2 && !got; attempt++) {
-        try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; got = true; }
-        catch (e) { lastErr = e; const retriable = (e.httpStatus === 499 || /UNHANDLED_EXCEPTION/i.test(e.message || '')); if (retriable === false) throw e; if (attempt === 0) await new Promise(r => setTimeout(r, 400)); }
-      }
-      if (got) break;
-    }
-    if (raw === undefined) throw lastErr;
-    if (!raw.currencies || !raw.currencies[0]) throw new Error('ไม่พบข้อมูลสกุลเงินของช่องทางนี้');
-    const cur = raw.currencies[0];
+    const raw = await getRawChannel(site, token, channelId);
+    if (!raw.currencies || !raw.currencies.length) throw new Error('ไม่พบข้อมูลสกุลเงินของช่องทางนี้');
+    const cur = raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0];   // ให้ตรงกับที่ getChannel แสดง (กันแก้ผิดสกุล)
     const changed = [];
 
     const numStr = (v) => {
@@ -562,6 +560,7 @@ async function loop() {
     const sites = await sb('GET', 'bo_sites?enabled=eq.true&select=id,name,web_url,api_base,cred_cipher,cipher_fp');
     const ids = new Set(sites.map(s => s.id));
     for (const id of sessions.keys()) if (!ids.has(id)) sessions.delete(id);
+    for (const id of fastSiteCache.keys()) if (!ids.has(id)) fastSiteCache.delete(id);   // ล้างเว็บที่ปิด/ลบ ไม่ให้ค้าง
     for (const site of sites) {
       try {
         await handleSite(site);
