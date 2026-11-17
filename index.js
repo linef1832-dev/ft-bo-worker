@@ -229,7 +229,7 @@ const AUTH_FAIL_STATUS = [ 401, 403, 498 ];
 const CURRENCIES = [ 'THB', 'USDT' ];
 
 // ---------- เรียก API หลังบ้าน (ผ่าน proxy + ใส่ token) ----------
-// ถ้าเจอ token หมดอายุ/ถูกตัด (401/403/498/499) จะล็อกอินใหม่แล้วลองซ้ำอัตโนมัติ 1 ครั้ง
+// ถ้าเจอ token หมดอายุ/ถูกตัด (401/403/498) จะล็อกอินใหม่แล้วลองซ้ำอัตโนมัติ 1 ครั้ง (499 ไม่ใช่ token — จัดการแยกที่ get/save)
 async function boApi(site, token, method, path, body, _retried) {
   const url = site.api_base + path;
   const res = await fetch(url, {
@@ -680,7 +680,7 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.7.1 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี)');
+log('🤖 K36 บอทหลังบ้าน v0.7.2 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + รวมโค้ดดึงค่า/แก้สกุลให้ตรง)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
