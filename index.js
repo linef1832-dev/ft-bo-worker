@@ -289,12 +289,17 @@ const K36 = {
     const cid = encodeURIComponent(channelId);
     let raw, lastErr;
     for (const c of CURRENCIES) {
-      try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; break; }
-      catch (e) {
-        lastErr = e;
-        const retriable = (e.httpStatus === 499 || /UNHANDLED_EXCEPTION/i.test(e.message || ''));
-        if (retriable === false) throw e;
+      let got = false;
+      for (let attempt = 0; attempt < 2 && !got; attempt++) {   // 499 ชั่วคราว → รอแล้วลองสกุลเดิมซ้ำอีก 1 ครั้ง
+        try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; got = true; }
+        catch (e) {
+          lastErr = e;
+          const retriable = (e.httpStatus === 499 || /UNHANDLED_EXCEPTION/i.test(e.message || ''));
+          if (retriable === false) throw e;
+          if (attempt === 0) await new Promise(r => setTimeout(r, 400));
+        }
       }
+      if (got) break;
     }
     if (raw === undefined) throw lastErr;
     const cur = (raw.currencies && (raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0])) || {};
@@ -346,8 +351,12 @@ const K36 = {
     const cid = encodeURIComponent(channelId);
     let raw, lastErr;
     for (const c of CURRENCIES) {
-      try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; break; }
-      catch (e) { lastErr = e; const retriable = (e.httpStatus === 499 || /UNHANDLED_EXCEPTION/i.test(e.message || '')); if (retriable === false) throw e; }
+      let got = false;
+      for (let attempt = 0; attempt < 2 && !got; attempt++) {
+        try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; got = true; }
+        catch (e) { lastErr = e; const retriable = (e.httpStatus === 499 || /UNHANDLED_EXCEPTION/i.test(e.message || '')); if (retriable === false) throw e; if (attempt === 0) await new Promise(r => setTimeout(r, 400)); }
+      }
+      if (got) break;
     }
     if (raw === undefined) throw lastErr;
     if (!raw.currencies || !raw.currencies[0]) throw new Error('ไม่พบข้อมูลสกุลเงินของช่องทางนี้');
@@ -483,18 +492,20 @@ async function runTask(site, token, task) {
   if (a === 'get_all_channels') {
     // ดึงทุกช่อง + ค่าปัจจุบัน ในงานเดียว (ให้เว็บ cache ไว้ สลับช่องขึ้นทันที)
     const list = await P.listChannels(site, token);
-    const out = [];
-    for (const ch of list) {
-      const item = { id: ch.id, code: ch.code, name: ch.name, staticname: ch.staticname };
-      try {
-        const d = await P.getChannel(site, token, ch.id);
-        delete d.raw;
-        item.data = d;
-      } catch (e) {
-        item.error = e.message || String(e);   // ช่องที่ดึงไม่ได้ ไม่ทำให้ทั้งชุดพัง
+    const out = new Array(list.length);
+    // ดึงค่าหลายช่อง "พร้อมกันทีละ 4" (เดิมทีละช่องต่อคิวกัน ช้ามาก)
+    const CONC = 4;
+    let i = 0;
+    const worker = async () => {
+      while (i < list.length) {
+        const idx = i++; const ch = list[idx];
+        const item = { id: ch.id, code: ch.code, name: ch.name, staticname: ch.staticname };
+        try { const d = await P.getChannel(site, token, ch.id); delete d.raw; item.data = d; }
+        catch (e) { item.error = e.message || String(e); }   // ช่องที่ดึงไม่ได้ ไม่ทำให้ทั้งชุดพัง
+        out[idx] = item;
       }
-      out.push(item);
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONC, list.length) }, worker));
     return { channels: out };
   }
   if (a === 'get_channel') {
