@@ -645,7 +645,14 @@ async function syncSiteChannels(site, token) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONC, list.length) }, worker));
-  if (rows.length) await sb('POST', 'bo_channels?on_conflict=site_id,channel_id', rows, 'resolution=merge-duplicates,return=minimal');
+  if (rows.length) {
+    await sb('POST', 'bo_channels?on_conflict=site_id,channel_id', rows, 'resolution=merge-duplicates,return=minimal');
+    // ลบช่องที่ไม่มีในหลังบ้านแล้วออกจาก snapshot (กันช่องผีค้าง) — ทำเฉพาะตอนได้ list ที่ถูกต้อง
+    try {
+      const inList = rows.map(r => '"' + String(r.channel_id).replace(/["\\]/g, '') + '"').join(',');
+      await sb('DELETE', `bo_channels?site_id=eq.${encodeURIComponent(site.id)}&channel_id=not.in.(${encodeURIComponent(inList)})`);
+    } catch (e) { /* ลบไม่สำเร็จไม่เป็นไร รอบหน้าค่อยลบ */ }
+  }
   return rows.length;
 }
 // อัปเดต snapshot ของช่องเดียว (เรียกหลังบันทึกสำเร็จ ให้ข้อมูลสดทันที)
