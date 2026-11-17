@@ -56,14 +56,14 @@ try {
 log('🔑 ลายนิ้วมือกุญแจ:', KEY_FP, '(ต้องตรงกับที่แสดงในหน้า K36)');
 
 // ---------- Supabase REST ----------
-async function sb(method, path, body) {
+async function sb(method, path, body, prefer) {
   const res = await fetch(SB_URL + '/rest/v1/' + path, {
     method,
     headers: {
       apikey: SB_KEY,
       Authorization: 'Bearer ' + SB_KEY,
       'Content-Type': 'application/json',
-      Prefer: 'return=minimal'
+      Prefer: prefer || 'return=minimal'
     },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
@@ -518,6 +518,7 @@ async function runTask(site, token, task) {
     if (!p.channel_id) throw new Error('ไม่ได้ระบุช่องทาง');
     if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนบันทึก');
     const r = await P.saveChannel(site, token, p.channel_id, p.changes || {});
+    syncOneChannel(site, token, p.channel_id);   // อัปเดต snapshot ของช่องนี้ให้สด (ไม่รอผล)
     return r;
   }
   if (a === 'ping') return { ok: true, name: site.name };
@@ -628,10 +629,57 @@ async function fastLoop() {
   }
 }
 
-log('🤖 K36 บอทหลังบ้าน v0.6.2 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว)');
+// ---------- Snapshot: เก็บช่องทาง+ค่าทุกเว็บไว้ใน Supabase ให้เว็บอ่านได้ทันที ----------
+async function syncSiteChannels(site, token) {
+  const P = platformOf(site);
+  const list = await P.listChannels(site, token);
+  const rows = new Array(list.length);
+  const CONC = 4; let i = 0;
+  const worker = async () => {
+    while (i < list.length) {
+      const idx = i++; const ch = list[idx];
+      const row = { site_id: site.id, channel_id: String(ch.id), code: ch.code || null, name: ch.name || null, staticname: ch.staticname || null, data: null, err: null, updated_at: new Date().toISOString() };
+      try { const d = await P.getChannel(site, token, ch.id); delete d.raw; row.data = d; }
+      catch (e) { row.err = e.message || String(e); }
+      rows[idx] = row;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONC, list.length) }, worker));
+  if (rows.length) await sb('POST', 'bo_channels?on_conflict=site_id,channel_id', rows, 'resolution=merge-duplicates,return=minimal');
+  return rows.length;
+}
+// อัปเดต snapshot ของช่องเดียว (เรียกหลังบันทึกสำเร็จ ให้ข้อมูลสดทันที)
+async function syncOneChannel(site, token, channelId) {
+  try {
+    const P = platformOf(site);
+    const d = await P.getChannel(site, token, channelId);
+    delete d.raw;
+    await sb('POST', 'bo_channels?on_conflict=site_id,channel_id',
+      [{ site_id: site.id, channel_id: String(channelId), data: d, err: null, updated_at: new Date().toISOString() }],
+      'resolution=merge-duplicates,return=minimal');
+  } catch (e) { /* เงียบ */ }
+}
+let syncRunning = false;
+async function syncLoop() {
+  if (syncRunning) return; syncRunning = true;
+  try {
+    const sites = [...fastSiteCache.values()];
+    for (const site of sites) {
+      const s = sessions.get(site.id);
+      if (!s || !s.token) continue;
+      try { const n = await syncSiteChannels(site, s.token); log('🗂️ snapshot', site.id, n, 'ช่อง'); }
+      catch (e) { log('⚠️ snapshot', site.id, e.message); }
+    }
+  } finally { syncRunning = false; }
+}
+const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
+
+log('🤖 K36 บอทหลังบ้าน v0.7.0 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
+setTimeout(syncLoop, 12 * 1000);   // ซิงค์ครั้งแรกหลังล็อกอินเสร็จ
+setInterval(syncLoop, SYNC_MS);
 
 process.on('SIGTERM', () => { log('👋 ปิดบอท'); process.exit(0); });
 process.on('unhandledRejection', e => log('⚠️ unhandled:', e && e.message));
