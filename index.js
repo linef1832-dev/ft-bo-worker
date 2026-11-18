@@ -309,20 +309,23 @@ const K36 = {
   // ดึงค่าปัจจุบันของช่องทาง (ค่าดิบ + ค่าที่แก้ได้แบบย่อ)
   // บางช่องเป็นสกุล USDT ไม่ใช่ THB → ขอ /THB ก่อน ถ้าพัง (499/UNHANDLED) ลอง /USDT
   async getChannel(site, token, channelId) {
-    // โหลดช่อง + รายการแบงก์พร้อมกัน (ขนาน ไม่เพิ่มเวลา) — แบงก์ไว้เช็กเปิด/ปิดประเภทให้แม่น
-    const [raw, banksRes] = await Promise.all([
-      getRawChannel(site, token, channelId),
-      boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(channelId)}&currency=THB`).catch(() => null)
-    ]);
+    const raw = await getRawChannel(site, token, channelId);
     const cur = (raw.currencies && (raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0])) || {};
     const pts = cur.paymenttypesetting || {};
     const ptcs = cur.paymentTypeChannelStatuses || {};
     const inList = Array.isArray(cur.depositPaymentTypes) ? cur.depositPaymentTypes : Object.keys(pts);
-    // สถานะเปิด/ปิดประเภท = ดูจาก "แบงก์จริง" (มีแบงก์เปิดอยู่ = ประเภทเปิด) แม่นสุด · ถ้าโหลดแบงก์ไม่ได้ค่อย fallback
-    let bankOn = null;
-    if (Array.isArray(banksRes)) { bankOn = {}; for (const b of banksRes) { if (b && b.isenabled) bankOn[b.depositPaymentTypeEnum] = true; } }
+    // สถานะเปิด/ปิดประเภท = อ่าน "แบงก์จริง ต่อประเภท" แบบเดียวกับตอนกดเปิด/ปิดเป๊ะ (depositPaymentTypeEnum)
+    // → snapshot ตรงกับความจริงเสมอ ไม่เด้งกลับเป็นเปิดหลังรีหน้า · อ่านประเภทไหนไม่ได้ค่อย fallback เฉพาะอันนั้น
+    const codes = Object.keys(pts);
+    const bankOn = {};
+    await Promise.all(codes.map(async code => {
+      try {
+        const banks = await boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(channelId)}&depositPaymentTypeEnum=${encodeURIComponent(code)}&currency=THB`);
+        if (Array.isArray(banks) && banks.length) bankOn[code] = banks.some(b => b && b.isenabled);   // มีแบงก์เปิดอยู่ = ประเภทเปิด
+      } catch (e) { /* อ่านไม่ได้ → ปล่อยให้ fallback */ }
+    }));
     const typeEnabled = code => {
-      if (bankOn) return !!bankOn[code];
+      if (bankOn[code] !== undefined) return bankOn[code];   // มีแบงก์จริงของประเภทนี้ → ใช้ค่าจากแบงก์ (แม่นสุด)
       const a = ptcs[code]; return (Array.isArray(a) && a.length) ? a.some(x => x && x.enabled) : inList.includes(code);
     };
     const types = {};
@@ -666,7 +669,7 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.7.5 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + อ่านสถานะจากแบงก์จริง + เร็วขึ้น)');
+log('🤖 K36 บอทหลังบ้าน v0.7.6 เริ่มทำงาน (แก้ช่องทาง + snapshot + อ่านสถานะแบงก์ต่อประเภทให้ตรงหลังบ้านเป๊ะ)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
