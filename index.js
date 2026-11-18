@@ -396,48 +396,51 @@ const K36 = {
       cur.suggestamounts = arr; changed.push('ปุ่มเงินแนะนำ ' + arr.length + ' ปุ่ม');
     }
 
-    // ประเภทการชำระเงิน — เปิด/ปิด = พลิก enabled ใน paymentTypeChannelStatuses (เหมือนหลังบ้านจริง)
-    // ไม่เอาประเภทออกจาก depositPaymentTypes / paymenttypesetting (หลังบ้านเก็บไว้ แค่ปิดสวิตช์ sub)
+    // ประเภทการชำระเงิน:
+    //  - min/max/ค่าธรรมเนียม → อยู่ใน paymenttypesetting (ไปกับ channel PUT)
+    //  - เปิด/ปิด (enabled) → ต้องยิง API แบงก์แยก (PUT /thirdpartypaymentbanks/isenabled) หลังบ้านไม่รับผ่าน channel PUT
+    const typeToggles = [];   // [{code, on}] เก็บไว้ยิงทีหลัง
     if (changes.types && typeof changes.types === 'object') {
       const pts = cur.paymenttypesetting || (cur.paymenttypesetting = {});
-      const ptcs = cur.paymentTypeChannelStatuses || (cur.paymentTypeChannelStatuses = {});
-      const DEFAULT_SUB = { QR_BANK: 1, PROMPTPAY: 1, TRUEMONEY: 1, DEBIT_CARD: 4, USDT: 2 };
       for (const code of Object.keys(changes.types)) {
         const t = changes.types[code];
         if (!VALID_PAYTYPES.includes(code)) continue;   // กันรหัสแปลกปลอม
-        const willCreate = !pts[code] && (t.enabled === true || t.min !== undefined || t.max !== undefined);
-        if (!pts[code]) {
-          if (!willCreate) continue;
-          pts[code] = { mindepositamt: '10', maxdepositamt: '10000', processingfeepct: '0', processingfeeconst: '0', depositfeepct: '0', depositfeeconst: '0' };
-          changed.push('สร้าง ' + code);
+        const hasMoney = (t.min !== undefined || t.max !== undefined || t.pfeepct !== undefined || t.pfeeconst !== undefined || t.dfeepct !== undefined || t.dfeeconst !== undefined);
+        if (hasMoney) {
+          if (!pts[code]) { pts[code] = { mindepositamt: '10', maxdepositamt: '10000', processingfeepct: '0', processingfeeconst: '0', depositfeepct: '0', depositfeeconst: '0' }; changed.push('สร้าง ' + code); }
+          if (t.min !== undefined) { pts[code].mindepositamt = numStr(t.min); changed.push(code + '.min=' + pts[code].mindepositamt); }
+          if (t.max !== undefined) { pts[code].maxdepositamt = numStr(t.max); changed.push(code + '.max=' + pts[code].maxdepositamt); }
+          if (t.pfeepct !== undefined) { pts[code].processingfeepct = numStr(t.pfeepct); changed.push(code + '.ผู้เล่น%'); }
+          if (t.pfeeconst !== undefined) { pts[code].processingfeeconst = numStr(t.pfeeconst); changed.push(code + '.ผู้เล่นบาท'); }
+          if (t.dfeepct !== undefined) { pts[code].depositfeepct = numStr(t.dfeepct); changed.push(code + '.บุคคลที่สาม%'); }
+          if (t.dfeeconst !== undefined) { pts[code].depositfeeconst = numStr(t.dfeeconst); changed.push(code + '.บุคคลที่สามบาท'); }
+          const mn = Number(pts[code].mindepositamt), mx = Number(pts[code].maxdepositamt);
+          if (isFinite(mn) && isFinite(mx) && mx < mn) throw new Error(code + ': ฝากสูงสุดน้อยกว่าขั้นต่ำ');
         }
-        if (t.min !== undefined) { pts[code].mindepositamt = numStr(t.min); changed.push(code + '.min=' + pts[code].mindepositamt); }
-        if (t.max !== undefined) { pts[code].maxdepositamt = numStr(t.max); changed.push(code + '.max=' + pts[code].maxdepositamt); }
-        if (t.pfeepct !== undefined) { pts[code].processingfeepct = numStr(t.pfeepct); changed.push(code + '.ผู้เล่น%'); }
-        if (t.pfeeconst !== undefined) { pts[code].processingfeeconst = numStr(t.pfeeconst); changed.push(code + '.ผู้เล่นบาท'); }
-        if (t.dfeepct !== undefined) { pts[code].depositfeepct = numStr(t.dfeepct); changed.push(code + '.บุคคลที่สาม%'); }
-        if (t.dfeeconst !== undefined) { pts[code].depositfeeconst = numStr(t.dfeeconst); changed.push(code + '.บุคคลที่สามบาท'); }
-        if (t.enabled !== undefined) {
-          const on = !!t.enabled;
-          let arr = ptcs[code];
-          if (!Array.isArray(arr) || !arr.length) arr = ptcs[code] = [{ subPaymentType: (DEFAULT_SUB[code] || 1), enabled: on }];
-          else arr.forEach(x => { if (x && typeof x === 'object') x.enabled = on; });
-          // เปิด = เผื่อยังไม่มีใน depositPaymentTypes ก็ใส่เข้าไป (ตอนปิดไม่เอาออก)
-          if (on && Array.isArray(cur.depositPaymentTypes) && !cur.depositPaymentTypes.includes(code)) cur.depositPaymentTypes.push(code);
-          changed.push((on ? 'เปิด ' : 'ปิด ') + code);
-        }
-        const mn = Number(pts[code].mindepositamt), mx = Number(pts[code].maxdepositamt);
-        if (isFinite(mn) && isFinite(mx) && mx < mn) throw new Error(code + ': ฝากสูงสุดน้อยกว่าขั้นต่ำ');
+        if (t.enabled !== undefined) typeToggles.push({ code, on: !!t.enabled });
       }
     }
 
-    if (!changed.length) return { changed: [], note: 'ไม่มีอะไรเปลี่ยน' };
+    if (!changed.length && !typeToggles.length) return { changed: [], note: 'ไม่มีอะไรเปลี่ยน' };
 
-    // กันกรณีค่าสด depositPaymentTypes เป็น null (หลังบ้านไม่รับ null บน PUT) — ไม่งั้นคงค่าเดิมไว้
+    // กันกรณีค่าสด depositPaymentTypes เป็น null (หลังบ้านไม่รับ null บน PUT)
     if (!Array.isArray(cur.depositPaymentTypes)) cur.depositPaymentTypes = Object.keys(cur.paymenttypesetting || {});
 
-    // ส่งทั้งก้อนกลับเหมือนหน้าเว็บ (merchantinfo/vipids/platform คงเดิมจากค่าสด)
-    await boApi(site, token, 'PUT', `/thirdpartypayments/${encodeURIComponent(channelId)}`, raw);
+    // 1) ถ้ามีการแก้ค่าช่อง (สถานะ/วงเงิน/min-max/ถอน ฯลฯ) → PUT ช่องทาง
+    if (changed.length) await boApi(site, token, 'PUT', `/thirdpartypayments/${encodeURIComponent(channelId)}`, raw);
+
+    // 2) เปิด/ปิดประเภท → ยิง API แบงก์ให้ครบทุกแบงก์ในประเภทนั้น
+    const chId = raw.thirdpartypaymentid || channelId;
+    for (const tg of typeToggles) {
+      try {
+        const banks = await boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(chId)}&depositPaymentTypeEnum=${encodeURIComponent(tg.code)}&currency=THB`);
+        const list = Array.isArray(banks) ? banks : [];
+        if (!list.length) { changed.push((tg.on ? 'เปิด ' : 'ปิด ') + tg.code + ' (ไม่มีแบงก์)'); continue; }
+        const body = list.map(b => ({ thirdpartypaymentid: chId, thirdpartypaymentbankcode: b.thirdpartypaymentbankcode, currency: 'THB', isenabled: tg.on }));
+        await boApi(site, token, 'PUT', '/thirdpartypaymentbanks/isenabled', body);
+        changed.push((tg.on ? 'เปิด ' : 'ปิด ') + tg.code + ' (' + body.length + ' แบงก์)');
+      } catch (e) { throw new Error('เปิด/ปิด ' + tg.code + ' ไม่สำเร็จ: ' + (e.message || e)); }
+    }
     return { changed };
   }
 };
@@ -654,7 +657,7 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.7.3 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + เปิด/ปิดประเภทผ่าน paymentTypeChannelStatuses)');
+log('🤖 K36 บอทหลังบ้าน v0.7.4 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + เปิด/ปิดประเภทผ่าน API แบงก์ isenabled)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
