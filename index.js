@@ -309,13 +309,22 @@ const K36 = {
   // ดึงค่าปัจจุบันของช่องทาง (ค่าดิบ + ค่าที่แก้ได้แบบย่อ)
   // บางช่องเป็นสกุล USDT ไม่ใช่ THB → ขอ /THB ก่อน ถ้าพัง (499/UNHANDLED) ลอง /USDT
   async getChannel(site, token, channelId) {
-    const raw = await getRawChannel(site, token, channelId);
+    // โหลดช่อง + รายการแบงก์พร้อมกัน (ขนาน ไม่เพิ่มเวลา) — แบงก์ไว้เช็กเปิด/ปิดประเภทให้แม่น
+    const [raw, banksRes] = await Promise.all([
+      getRawChannel(site, token, channelId),
+      boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(channelId)}&currency=THB`).catch(() => null)
+    ]);
     const cur = (raw.currencies && (raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0])) || {};
     const pts = cur.paymenttypesetting || {};
     const ptcs = cur.paymentTypeChannelStatuses || {};
     const inList = Array.isArray(cur.depositPaymentTypes) ? cur.depositPaymentTypes : Object.keys(pts);
-    // เปิด/ปิดประเภท = ดูที่ paymentTypeChannelStatuses (sub ใดเปิด = ประเภทเปิด) ถ้าไม่มีค่อย fallback ไป depositPaymentTypes
-    const typeEnabled = code => { const a = ptcs[code]; return (Array.isArray(a) && a.length) ? a.some(x => x && x.enabled) : inList.includes(code); };
+    // สถานะเปิด/ปิดประเภท = ดูจาก "แบงก์จริง" (มีแบงก์เปิดอยู่ = ประเภทเปิด) แม่นสุด · ถ้าโหลดแบงก์ไม่ได้ค่อย fallback
+    let bankOn = null;
+    if (Array.isArray(banksRes)) { bankOn = {}; for (const b of banksRes) { if (b && b.isenabled) bankOn[b.depositPaymentTypeEnum] = true; } }
+    const typeEnabled = code => {
+      if (bankOn) return !!bankOn[code];
+      const a = ptcs[code]; return (Array.isArray(a) && a.length) ? a.some(x => x && x.enabled) : inList.includes(code);
+    };
     const types = {};
     for (const code of Object.keys(pts)) {
       types[code] = {
@@ -359,54 +368,60 @@ const K36 = {
   // changes = { status?, maxdailyamt?, maxtotalamt?, minpayoutamt?, maxpayoutamt?,
   //             amountsuggest?, suggestamounts?, types?: {CODE:{enabled?,min?,max?}} }
   async saveChannel(site, token, channelId, changes) {
-    const raw = await getRawChannel(site, token, channelId);
-    if (!raw.currencies || !raw.currencies.length) throw new Error('ไม่พบข้อมูลสกุลเงินของช่องทางนี้');
-    const cur = raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0];   // ให้ตรงกับที่ getChannel แสดง (กันแก้ผิดสกุล)
     const changed = [];
-
     const numStr = (v) => {
       const n = String(v).replace(/[, ]/g, '');
       if (!/^\d+(\.\d+)?$/.test(n)) throw new Error('ค่าตัวเลขไม่ถูกต้อง: ' + v);
       return n;
     };
 
-    if (changes.status !== undefined) {
-      const st = Number(changes.status);
-      if (![1, 2, 4, 8].includes(st)) throw new Error('สถานะฝากไม่ถูกต้อง');   // 1=เปิด 2=สำรอง 4=ปิดการใช้งาน 8=ปิด
-      if (cur.status !== st) { cur.status = st; changed.push('สถานะฝาก=' + st); }
-    }
-    if (changes.supportpayout !== undefined) {
-      const b = !!changes.supportpayout;   // true=เปิดถอน false=ปิดถอน
-      if (cur.supportpayout !== b) { cur.supportpayout = b; changed.push('สถานะถอน=' + (b ? 'เปิด' : 'ปิด')); }
-    }
-    for (const k of ['maxdailyamt', 'maxtotalamt', 'minpayoutamt', 'maxpayoutamt']) {
-      if (changes[k] !== undefined) {
-        const v = numStr(changes[k]);
-        if (String(cur[k]) !== v) { cur[k] = v; changed.push(k + '=' + v); }
-      }
-    }
-    // ค่าธรรมเนียมถอน (% + บาท) + หมายเหตุ
-    if (changes.payoutfeepct !== undefined) { cur.payoutfeepct = numStr(changes.payoutfeepct); changed.push('ค่าธรรมเนียมถอน%=' + cur.payoutfeepct); }
-    if (changes.payoutfeeconst !== undefined) { cur.payoutfeeconst = numStr(changes.payoutfeeconst); changed.push('ค่าธรรมเนียมถอนบาท=' + cur.payoutfeeconst); }
-    if (changes.remark !== undefined) { cur.remark = String(changes.remark); changed.push('หมายเหตุ'); }
-    if (changes.amountsuggest !== undefined) { cur.amountsuggest = !!changes.amountsuggest; changed.push('amountsuggest=' + cur.amountsuggest); }
-    if (Array.isArray(changes.suggestamounts)) {
-      const arr = changes.suggestamounts.map(x => Number(String(x).replace(/[, ]/g, '')));
-      if (arr.some(n => !isFinite(n) || n < 0)) throw new Error('ปุ่มจำนวนเงินมีค่าไม่ถูกต้อง');
-      cur.suggestamounts = arr; changed.push('ปุ่มเงินแนะนำ ' + arr.length + ' ปุ่ม');
-    }
-
-    // ประเภทการชำระเงิน:
-    //  - min/max/ค่าธรรมเนียม → อยู่ใน paymenttypesetting (ไปกับ channel PUT)
-    //  - เปิด/ปิด (enabled) → ต้องยิง API แบงก์แยก (PUT /thirdpartypaymentbanks/isenabled) หลังบ้านไม่รับผ่าน channel PUT
-    const typeToggles = [];   // [{code, on}] เก็บไว้ยิงทีหลัง
+    // แยกงาน: เปิด/ปิดประเภท (enabled) → ยิง API แบงก์ · อย่างอื่น → PUT ช่องทาง
+    const typeToggles = [];   // [{code, on}]
+    const CHAN_FIELDS = ['status', 'supportpayout', 'maxdailyamt', 'maxtotalamt', 'minpayoutamt', 'maxpayoutamt', 'payoutfeepct', 'payoutfeeconst', 'remark', 'amountsuggest', 'suggestamounts'];
+    let needsChannel = CHAN_FIELDS.some(k => changes[k] !== undefined);
     if (changes.types && typeof changes.types === 'object') {
-      const pts = cur.paymenttypesetting || (cur.paymenttypesetting = {});
       for (const code of Object.keys(changes.types)) {
         const t = changes.types[code];
-        if (!VALID_PAYTYPES.includes(code)) continue;   // กันรหัสแปลกปลอม
-        const hasMoney = (t.min !== undefined || t.max !== undefined || t.pfeepct !== undefined || t.pfeeconst !== undefined || t.dfeepct !== undefined || t.dfeeconst !== undefined);
-        if (hasMoney) {
+        if (!VALID_PAYTYPES.includes(code)) continue;
+        if (t.min !== undefined || t.max !== undefined || t.pfeepct !== undefined || t.pfeeconst !== undefined || t.dfeepct !== undefined || t.dfeeconst !== undefined) needsChannel = true;
+        if (t.enabled !== undefined) typeToggles.push({ code, on: !!t.enabled });
+      }
+    }
+    if (!needsChannel && !typeToggles.length) return { changed: [], note: 'ไม่มีอะไรเปลี่ยน' };
+
+    // ===== ส่วนที่ต้องแตะค่าช่อง (สถานะ/วงเงิน/min-max/ถอน) → โหลดช่อง + PUT =====
+    if (needsChannel) {
+      const raw = await getRawChannel(site, token, channelId);
+      if (!raw.currencies || !raw.currencies.length) throw new Error('ไม่พบข้อมูลสกุลเงินของช่องทางนี้');
+      const cur = raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0];
+      if (changes.status !== undefined) {
+        const st = Number(changes.status);
+        if (![1, 2, 4, 8].includes(st)) throw new Error('สถานะฝากไม่ถูกต้อง');
+        if (cur.status !== st) { cur.status = st; changed.push('สถานะฝาก=' + st); }
+      }
+      if (changes.supportpayout !== undefined) {
+        const b = !!changes.supportpayout;
+        if (cur.supportpayout !== b) { cur.supportpayout = b; changed.push('สถานะถอน=' + (b ? 'เปิด' : 'ปิด')); }
+      }
+      for (const k of ['maxdailyamt', 'maxtotalamt', 'minpayoutamt', 'maxpayoutamt']) {
+        if (changes[k] !== undefined) { const v = numStr(changes[k]); if (String(cur[k]) !== v) { cur[k] = v; changed.push(k + '=' + v); } }
+      }
+      if (changes.payoutfeepct !== undefined) { cur.payoutfeepct = numStr(changes.payoutfeepct); changed.push('ค่าธรรมเนียมถอน%=' + cur.payoutfeepct); }
+      if (changes.payoutfeeconst !== undefined) { cur.payoutfeeconst = numStr(changes.payoutfeeconst); changed.push('ค่าธรรมเนียมถอนบาท=' + cur.payoutfeeconst); }
+      if (changes.remark !== undefined) { cur.remark = String(changes.remark); changed.push('หมายเหตุ'); }
+      if (changes.amountsuggest !== undefined) { cur.amountsuggest = !!changes.amountsuggest; changed.push('amountsuggest=' + cur.amountsuggest); }
+      if (Array.isArray(changes.suggestamounts)) {
+        const arr = changes.suggestamounts.map(x => Number(String(x).replace(/[, ]/g, '')));
+        if (arr.some(n => !isFinite(n) || n < 0)) throw new Error('ปุ่มจำนวนเงินมีค่าไม่ถูกต้อง');
+        cur.suggestamounts = arr; changed.push('ปุ่มเงินแนะนำ ' + arr.length + ' ปุ่ม');
+      }
+      // min/max/ค่าธรรมเนียม ราย type (อยู่ใน paymenttypesetting)
+      if (changes.types) {
+        const pts = cur.paymenttypesetting || (cur.paymenttypesetting = {});
+        for (const code of Object.keys(changes.types)) {
+          const t = changes.types[code];
+          if (!VALID_PAYTYPES.includes(code)) continue;
+          if (!(t.min !== undefined || t.max !== undefined || t.pfeepct !== undefined || t.pfeeconst !== undefined || t.dfeepct !== undefined || t.dfeeconst !== undefined)) continue;
           if (!pts[code]) { pts[code] = { mindepositamt: '10', maxdepositamt: '10000', processingfeepct: '0', processingfeeconst: '0', depositfeepct: '0', depositfeeconst: '0' }; changed.push('สร้าง ' + code); }
           if (t.min !== undefined) { pts[code].mindepositamt = numStr(t.min); changed.push(code + '.min=' + pts[code].mindepositamt); }
           if (t.max !== undefined) { pts[code].maxdepositamt = numStr(t.max); changed.push(code + '.max=' + pts[code].maxdepositamt); }
@@ -417,29 +432,23 @@ const K36 = {
           const mn = Number(pts[code].mindepositamt), mx = Number(pts[code].maxdepositamt);
           if (isFinite(mn) && isFinite(mx) && mx < mn) throw new Error(code + ': ฝากสูงสุดน้อยกว่าขั้นต่ำ');
         }
-        if (t.enabled !== undefined) typeToggles.push({ code, on: !!t.enabled });
       }
+      if (!Array.isArray(cur.depositPaymentTypes)) cur.depositPaymentTypes = Object.keys(cur.paymenttypesetting || {});
+      if (changed.length) await boApi(site, token, 'PUT', `/thirdpartypayments/${encodeURIComponent(channelId)}`, raw);
     }
 
-    if (!changed.length && !typeToggles.length) return { changed: [], note: 'ไม่มีอะไรเปลี่ยน' };
-
-    // กันกรณีค่าสด depositPaymentTypes เป็น null (หลังบ้านไม่รับ null บน PUT)
-    if (!Array.isArray(cur.depositPaymentTypes)) cur.depositPaymentTypes = Object.keys(cur.paymenttypesetting || {});
-
-    // 1) ถ้ามีการแก้ค่าช่อง (สถานะ/วงเงิน/min-max/ถอน ฯลฯ) → PUT ช่องทาง
-    if (changed.length) await boApi(site, token, 'PUT', `/thirdpartypayments/${encodeURIComponent(channelId)}`, raw);
-
-    // 2) เปิด/ปิดประเภท → ยิง API แบงก์ให้ครบทุกแบงก์ในประเภทนั้น
-    const chId = raw.thirdpartypaymentid || channelId;
-    for (const tg of typeToggles) {
-      try {
-        const banks = await boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(chId)}&depositPaymentTypeEnum=${encodeURIComponent(tg.code)}&currency=THB`);
-        const list = Array.isArray(banks) ? banks : [];
-        if (!list.length) { changed.push((tg.on ? 'เปิด ' : 'ปิด ') + tg.code + ' (ไม่มีแบงก์)'); continue; }
-        const body = list.map(b => ({ thirdpartypaymentid: chId, thirdpartypaymentbankcode: b.thirdpartypaymentbankcode, currency: 'THB', isenabled: tg.on }));
-        await boApi(site, token, 'PUT', '/thirdpartypaymentbanks/isenabled', body);
-        changed.push((tg.on ? 'เปิด ' : 'ปิด ') + tg.code + ' (' + body.length + ' แบงก์)');
-      } catch (e) { throw new Error('เปิด/ปิด ' + tg.code + ' ไม่สำเร็จ: ' + (e.message || e)); }
+    // ===== เปิด/ปิดประเภท → ยิง API แบงก์ (ขนานทุกประเภท) =====
+    if (typeToggles.length) {
+      await Promise.all(typeToggles.map(async tg => {
+        try {
+          const banks = await boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(channelId)}&depositPaymentTypeEnum=${encodeURIComponent(tg.code)}&currency=THB`);
+          const list = Array.isArray(banks) ? banks : [];
+          if (!list.length) { changed.push((tg.on ? 'เปิด ' : 'ปิด ') + tg.code + ' (ไม่มีแบงก์)'); return; }
+          const body = list.map(b => ({ thirdpartypaymentid: channelId, thirdpartypaymentbankcode: b.thirdpartypaymentbankcode, currency: 'THB', isenabled: tg.on }));
+          await boApi(site, token, 'PUT', '/thirdpartypaymentbanks/isenabled', body);
+          changed.push((tg.on ? 'เปิด ' : 'ปิด ') + tg.code + ' (' + body.length + ' แบงก์)');
+        } catch (e) { throw new Error('เปิด/ปิด ' + tg.code + ' ไม่สำเร็จ: ' + (e.message || e)); }
+      }));
     }
     return { changed };
   }
@@ -657,7 +666,7 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.7.4 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + เปิด/ปิดประเภทผ่าน API แบงก์ isenabled)');
+log('🤖 K36 บอทหลังบ้าน v0.7.5 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + อ่านสถานะจากแบงก์จริง + เร็วขึ้น)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
