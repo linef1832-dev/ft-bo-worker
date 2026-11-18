@@ -162,6 +162,7 @@ async function login(site, cred) {
 
 async function handleSite(site) {
   fastSiteCache.set(site.id, site); // ให้วงจรเร็วใช้ข้อมูล site นี้
+  if (siteBusy.has(site.id)) return; // วงจรเร็วกำลังทำงานของเว็บนี้อยู่ — ไม่ล็อกอินซ้อน (กัน token เดิมถูกตัดกลางงาน)
   const now = Date.now();
   let s = sessions.get(site.id) || {};
 
@@ -517,6 +518,7 @@ function normSiteBank(b) {
 
 const bankKey = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
 
+const BANK_PUT_CONC = 10;
 const SITE_BANKS = {
   async list(site, token, currency) {
     const rows = (await fetchSiteBanks(site, token, currency)).map(normSiteBank);
@@ -548,7 +550,7 @@ const SITE_BANKS = {
     }
     const diff = wanted.filter(w => w.bank.open !== w.open);
 
-    // ยิงทีละ 4 ตัว (หลังบ้านเป็น API ทีละแบงก์)
+    // ยิงพร้อมกันทีละ BANK_PUT_CONC ตัว (หลังบ้านเป็น API ทีละแบงก์)
     const failed = [];
     let i = 0;
     const worker = async () => {
@@ -560,7 +562,7 @@ const SITE_BANKS = {
         } catch (e) { failed.push(w.bank.name + ': ' + (e.message || e)); }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(4, diff.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(BANK_PUT_CONC, diff.length) }, worker));
 
     // อ่านกลับเพื่อยืนยันค่าจริง
     const after = diff.length ? (await fetchSiteBanks(site, token, currency)).map(normSiteBank) : current;
@@ -647,7 +649,14 @@ async function runTask(site, token, task) {
   throw new Error('ไม่รู้จักคำสั่ง: ' + a);
 }
 
+// ล็อกต่อเว็บ: กันวงจรหลัก/วงจรเร็วหยิบงานของเว็บเดียวกันพร้อมกัน (แต่ต่างเว็บทำขนานกันได้)
+const siteBusy = new Set();
 async function processTasks(site, token) {
+  if (siteBusy.has(site.id)) return;
+  siteBusy.add(site.id);
+  try { await processTasksLocked(site, token); } finally { siteBusy.delete(site.id); }
+}
+async function processTasksLocked(site, token) {
   // หยิบงานที่ค้างของเว็บนี้ ทีละงาน (เรียงเก่าสุดก่อน)
   const tasks = await sb('GET',
     `bo_tasks?site_id=eq.${encodeURIComponent(site.id)}&status=eq.queued&order=created_at.asc&limit=5&select=*`);
@@ -723,7 +732,7 @@ if (PROXY_URL) {
 let fastRunning = false;
 const FAST_POLL_MS = 300;   // เช็กงานใหม่ทุก 0.3 วินาที
 async function fastLoop() {
-  if (fastRunning || running) return; // เลี่ยงชนกับ loop หลัก
+  if (fastRunning) return; // ไม่รอ loop หลักแล้ว — ใช้ล็อกต่อเว็บ (siteBusy) แทน
   fastRunning = true;
   try {
     const rows = await sb('GET', 'bo_tasks?status=eq.queued&select=site_id&limit=20');
@@ -732,8 +741,8 @@ async function fastLoop() {
       const siteIds = [...new Set(rows.map(r => r.site_id))].filter(sid => {
         const s = sessions.get(sid); return s && s.token && fastSiteCache.get(sid);
       });
-      // ประมวลผลหลายเว็บ "พร้อมกัน" ทีละ 4 (แต่ละเว็บคนละ session/หลังบ้าน จึงขนานได้)
-      const CONC = 4;
+      // ประมวลผลทุกเว็บ "พร้อมกัน" (แต่ละเว็บคนละ session/หลังบ้าน จึงขนานได้)
+      const CONC = 12;
       let i = 0;
       const worker = async () => {
         while (i < siteIds.length) {
@@ -887,7 +896,7 @@ async function scheduleLoop() {
   } finally { schedRunning = false; }
 }
 
-log('🤖 K36 บอทหลังบ้าน v0.9.1 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
+log('🤖 K36 บอทหลังบ้าน v0.9.2 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
