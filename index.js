@@ -466,11 +466,12 @@ const K36 = {
 // ========================================================
 const BANK_ST_NORMAL = 1, BANK_ST_MAINT = 2;
 
-async function fetchSiteBanks(site, token, currency) {
+async function fetchSiteBanksPaged(site, token, currency, status) {
   const LIMIT = 100, out = [];
   for (let offset = 0; offset < 5000; offset += LIMIT) {
     const q = new URLSearchParams({ offset: String(offset), limit: String(LIMIT), sort: 'ASC', sortcolumn: 'banknameen' });
     if (currency) q.set('currency', currency);
+    if (status !== undefined) q.set('status', String(status));
     const res = await boApi(site, token, 'GET', '/banks/search?' + q.toString());
     const rows = Array.isArray(res) ? res : ((res && (res.data || res.list || res.rows || res.content)) || []);
     out.push(...rows);
@@ -478,6 +479,17 @@ async function fetchSiteBanks(site, token, currency) {
     if (rows.length < LIMIT || (isFinite(total) && out.length >= total)) break;
   }
   return out;
+}
+// หน้าค้นหาหลังบ้านตั้งตัวกรอง status=1 เป็นค่าเริ่มต้น → ถ้าเซิร์ฟเวอร์กรองเหมือนกัน แบงก์ที่ปิดปรับปรุง (2) จะหายจากรายการ
+// จึงขอ status=2 แยกอีกรอบแล้วรวม (ตัดซ้ำด้วย bankid) — ถูกต้องไม่ว่าเซิร์ฟเวอร์จะกรองหรือไม่
+async function fetchSiteBanks(site, token, currency) {
+  const [base, maint] = await Promise.all([
+    fetchSiteBanksPaged(site, token, currency),
+    fetchSiteBanksPaged(site, token, currency, BANK_ST_MAINT).catch(() => [])
+  ]);
+  const seen = new Map();
+  for (const b of base.concat(maint)) if (b && b.bankid != null && !seen.has(String(b.bankid))) seen.set(String(b.bankid), b);
+  return [...seen.values()];
 }
 
 function normSiteBank(b) {
@@ -786,7 +798,7 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.8.0 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหน้าบ้านหลายเว็บ)');
+log('🤖 K36 บอทหลังบ้าน v0.8.1 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหน้าบ้านหลายเว็บ)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
