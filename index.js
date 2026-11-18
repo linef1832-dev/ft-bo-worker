@@ -798,12 +798,97 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.8.1 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหน้าบ้านหลายเว็บ)');
+// ---------- ตั้งเวลาเปิด/ปิดธนาคารประจำวัน ----------
+// ตารางเวลาเก็บใน settings: key 'ft_bank_schedules' = JSON array (หน้าเว็บ FT เป็นคนแก้)
+//   { id, label, action:'open'|'close', time:'HH:MM', days:'daily'|[0-6 (0=อา)],
+//     sites:'all'|[site_id], scope:'all'|'pick', banks:[ชื่อธนาคาร], on:true|false }
+// สถานะการรันเก็บแยก key 'ft_bank_schedule_runs' = { [id]: { key, at, batch, sites } } (กันรันซ้ำ / ไม่ชนตอนหน้าเว็บแก้ตาราง)
+// เวลาอิงไทย (Asia/Bangkok) · ถ้าบอทดับตอนถึงเวลา จะตามรันให้ภายใน 10 นาที เลยจากนั้นข้าม (กันเปิด/ปิดผิดจังหวะ)
+const SCHED_KEY = 'ft_bank_schedules', SCHED_RUNS_KEY = 'ft_bank_schedule_runs';
+const SCHED_POLL_MS = 20 * 1000, SCHED_GRACE_MIN = 10;
+
+function bangkokNow() {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', weekday: 'short', hour12: false
+  }).formatToParts(new Date()).map(x => [x.type, x.value]));
+  const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(p.weekday);
+  return { date: `${p.year}-${p.month}-${p.day}`, minutes: (Number(p.hour) % 24) * 60 + Number(p.minute), dow };
+}
+async function getSetting(key) {
+  const rows = await sb('GET', `settings?key=eq.${encodeURIComponent(key)}&select=value`);
+  if (!rows || !rows.length || rows[0].value == null) return null;
+  try { return JSON.parse(rows[0].value); } catch (e) { return null; }
+}
+async function putSetting(key, obj) {
+  const value = JSON.stringify(obj);
+  const upd = await sb('PATCH', `settings?key=eq.${encodeURIComponent(key)}`, { value }, 'return=representation');
+  if (!upd || !upd.length) await sb('POST', 'settings', [{ key, value }]);
+}
+
+// คืนรายการที่ "ถึงเวลา" ตอนนี้ (ยังไม่เคยรันรอบนี้)
+function dueSchedules(list, runs, now) {
+  const out = [];
+  for (const s of (Array.isArray(list) ? list : [])) {
+    if (!s || !s.on || !s.id || !/^\d{1,2}:\d{2}$/.test(s.time || '')) continue;
+    if (s.action !== 'open' && s.action !== 'close') continue;
+    if (s.days !== 'daily' && !(Array.isArray(s.days) && s.days.map(Number).includes(now.dow))) continue;
+    const [hh, mm] = s.time.split(':').map(Number);
+    const at = hh * 60 + mm, late = now.minutes - at;
+    if (late < 0 || late > SCHED_GRACE_MIN) continue;
+    const runKey = now.date + ' ' + s.time;          // แก้เวลาใหม่ในวันเดียวกัน = รอบใหม่ รันได้
+    if (runs[s.id] && runs[s.id].key === runKey) continue;
+    out.push({ s, runKey });
+  }
+  return out;
+}
+
+let schedRunning = false;
+async function scheduleLoop() {
+  if (schedRunning) return; schedRunning = true;
+  try {
+    const list = await getSetting(SCHED_KEY);
+    if (!Array.isArray(list) || !list.length) return;
+    const runs = (await getSetting(SCHED_RUNS_KEY)) || {};
+    const due = dueSchedules(list, runs, bangkokNow());
+    if (!due.length) return;
+
+    const sites = await sb('GET', 'bo_sites?enabled=eq.true&select=id');
+    const allIds = (sites || []).map(x => x.id);
+    for (const { s, runKey } of due) {
+      const targets = s.sites === 'all' || !Array.isArray(s.sites) ? allIds : s.sites.filter(id => allIds.includes(id));
+      const open = s.action === 'open';
+      const params = s.scope === 'pick'
+        ? { banks: (s.banks || []).map(name => ({ name, open })) }
+        : { all: open };
+      const batch = 'sch-' + s.id + '-' + Date.now().toString(36);
+      // จดว่ารันแล้ว "ก่อน" สร้างงาน — ถ้าสร้างงานพังกลางทาง จะไม่ยิงซ้ำรัว ๆ
+      runs[s.id] = { key: runKey, at: new Date().toISOString(), batch, sites: targets };
+      await putSetting(SCHED_RUNS_KEY, runs);
+      if (!targets.length || (s.scope === 'pick' && !params.banks.length)) { log('⏰ ข้าม', s.label || s.id, '(ไม่มีเว็บ/ธนาคาร)'); continue; }
+      params.batch_id = batch;
+      const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      await sb('POST', 'bo_tasks', targets.map(site_id => ({
+        site_id, action: 'set_site_banks', params, confirmed: true, batch_id: batch,
+        created_by: 'ตั้งเวลา: ' + (s.label || s.time), expires_at: expires
+      })));
+      sb('POST', 'system_logs', [{ action: 'FT_BANK_SCHEDULE', performed_by: 'ตั้งเวลา',
+        detail: JSON.stringify({ v: 1, id: s.id, label: s.label, action: s.action, time: s.time, scope: s.scope, banks: s.banks || [], sites: targets, batch }) }]).catch(() => {});
+      log('⏰ ตั้งเวลา', s.label || s.id, (open ? 'เปิด' : 'ปิด'), s.scope === 'pick' ? (s.banks || []).length + ' ธนาคาร' : 'ทุกธนาคาร', '→', targets.join(','));
+    }
+  } catch (e) {
+    log('⚠️ ตั้งเวลา', e.message);
+  } finally { schedRunning = false; }
+}
+
+log('🤖 K36 บอทหลังบ้าน v0.9.0 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
 setTimeout(syncLoop, 12 * 1000);   // ซิงค์ครั้งแรกหลังล็อกอินเสร็จ
 setInterval(syncLoop, SYNC_MS);
+setTimeout(scheduleLoop, 15 * 1000);   // รอให้ล็อกอินเสร็จก่อน
+setInterval(scheduleLoop, SCHED_POLL_MS);
 
 process.on('SIGTERM', () => { log('👋 ปิดบอท'); process.exit(0); });
 process.on('unhandledRejection', e => log('⚠️ unhandled:', e && e.message));
