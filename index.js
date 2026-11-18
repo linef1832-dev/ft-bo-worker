@@ -457,6 +457,112 @@ const K36 = {
   }
 };
 
+// ========================================================
+// หน้า "รายชื่อธนาคาร" ของหลังบ้าน (การเงิน → ประเภทธนาคาร)
+// สวิตช์ "การดูแลรักษาด้านหน้า" = ฟิลด์ status ของแบงก์
+//   status 1 = ปกติ (หน้าบ้านใช้ได้)   status 2 = ปิดปรับปรุงหน้าบ้าน
+//   ค่าอื่น (เช่น 0) = แบงก์ไม่ได้เปิดใช้ → บอทไม่แตะ (กันเผลอไปเปิดแบงก์ที่ปิดไว้)
+// API เดียวกับที่หน้าเว็บหลังบ้านใช้: GET /banks/search , PUT /banks/{bankid}/status {status}
+// ========================================================
+const BANK_ST_NORMAL = 1, BANK_ST_MAINT = 2;
+
+async function fetchSiteBanks(site, token, currency) {
+  const LIMIT = 100, out = [];
+  for (let offset = 0; offset < 5000; offset += LIMIT) {
+    const q = new URLSearchParams({ offset: String(offset), limit: String(LIMIT), sort: 'ASC', sortcolumn: 'banknameen' });
+    if (currency) q.set('currency', currency);
+    const res = await boApi(site, token, 'GET', '/banks/search?' + q.toString());
+    const rows = Array.isArray(res) ? res : ((res && (res.data || res.list || res.rows || res.content)) || []);
+    out.push(...rows);
+    const total = res && !Array.isArray(res) ? Number(res.total ?? res.totalCount ?? res.count) : NaN;
+    if (rows.length < LIMIT || (isFinite(total) && out.length >= total)) break;
+  }
+  return out;
+}
+
+function normSiteBank(b) {
+  const st = Number(b.status);
+  return {
+    bankid: String(b.bankid),
+    name: b.banknameen || b.banknamesc || String(b.bankid),
+    namesc: b.banknamesc || '',
+    currency: b.currency || '',
+    paymenttype: b.bankpaymenttype,
+    status: st,
+    maintenance: st === BANK_ST_MAINT,          // true = ปิดปรับปรุงหน้าบ้านอยู่
+    open: st === BANK_ST_NORMAL,                // true = หน้าบ้านใช้ได้ (สวิตช์ "เปิด" ในหน้า FT)
+    togglable: st === BANK_ST_NORMAL || st === BANK_ST_MAINT,
+    image: b.bankimage || '',
+    url: b.bankurl || ''
+  };
+}
+
+const bankKey = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+const SITE_BANKS = {
+  async list(site, token, currency) {
+    const rows = (await fetchSiteBanks(site, token, currency)).map(normSiteBank);
+    return { site_id: site.id, banks: rows, total: rows.length,
+             open: rows.filter(b => b.open).length, closed: rows.filter(b => b.maintenance).length };
+  },
+
+  // banks: [{ bankid?, name?, open: true|false }]  — name = banknameen (ใช้ตอนสั่งหลายเว็บ เพราะ bankid แต่ละเว็บไม่ตรงกัน)
+  // all:   true = เปิดทั้งหมด, false = ปิดทั้งหมด (เฉพาะแบงก์ที่ togglable)
+  async set(site, token, banks, all, currency) {
+    const current = (await fetchSiteBanks(site, token, currency)).map(normSiteBank);
+    if (!current.length) throw new Error('ไม่พบรายชื่อธนาคารในหลังบ้าน');
+    const byId = new Map(current.map(b => [b.bankid, b]));
+    const byName = new Map();
+    for (const b of current) for (const n of [b.name, b.namesc]) if (n) byName.set(bankKey(n), b);
+
+    let wanted = [];          // [{bank, open}]
+    const notFound = [], skipped = [];
+    if (all === true || all === false) {
+      for (const b of current) { if (b.togglable) wanted.push({ bank: b, open: all }); }
+    } else {
+      if (!Array.isArray(banks) || !banks.length) throw new Error('ไม่ได้ระบุธนาคารที่จะเปิด/ปิด');
+      for (const x of banks) {
+        const b = (x && x.bankid != null && byId.get(String(x.bankid))) || (x && x.name && byName.get(bankKey(x.name)));
+        if (!b) { notFound.push((x && (x.name || x.bankid)) || '?'); continue; }
+        if (!b.togglable) { skipped.push(b.name + ' (status=' + b.status + ')'); continue; }
+        wanted.push({ bank: b, open: !!x.open });
+      }
+    }
+    const diff = wanted.filter(w => w.bank.open !== w.open);
+
+    // ยิงทีละ 4 ตัว (หลังบ้านเป็น API ทีละแบงก์)
+    const failed = [];
+    let i = 0;
+    const worker = async () => {
+      while (i < diff.length) {
+        const w = diff[i++];
+        try {
+          await boApi(site, token, 'PUT', `/banks/${encodeURIComponent(w.bank.bankid)}/status`,
+                      { status: w.open ? BANK_ST_NORMAL : BANK_ST_MAINT });
+        } catch (e) { failed.push(w.bank.name + ': ' + (e.message || e)); }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, diff.length) }, worker));
+
+    // อ่านกลับเพื่อยืนยันค่าจริง
+    const after = diff.length ? (await fetchSiteBanks(site, token, currency)).map(normSiteBank) : current;
+    const afterById = new Map(after.map(b => [b.bankid, b]));
+    const changed = [], notApplied = [];
+    for (const w of diff) {
+      const b = afterById.get(w.bank.bankid);
+      if (b && b.open === w.open) changed.push((w.open ? 'เปิด ' : 'ปิด ') + w.bank.name);
+      else if (!failed.some(f => f.startsWith(w.bank.name + ':'))) notApplied.push(w.bank.name);
+    }
+    const result = { site_id: site.id, changed, banks: after,
+                     not_found: notFound, skipped, failed, not_applied: notApplied };
+    // พังทั้งหมด = งาน failed ; พังบางตัว = งาน done แต่มีรายการ failed/not_applied ให้หน้าเว็บโชว์
+    if (diff.length && !changed.length && (failed.length || notApplied.length)) {
+      throw new Error('เปิด/ปิดธนาคารไม่สำเร็จ: ' + failed.concat(notApplied).join(' | '));
+    }
+    return result;
+  }
+};
+
 const PLATFORMS = { k36: K36, tf6: K36, default: K36 };
 function platformOf(site) { return PLATFORMS[site.platform] || PLATFORMS.default; }
 
@@ -506,6 +612,17 @@ async function runTask(site, token, task) {
     if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนบันทึก');
     const r = await P.saveChannel(site, token, p.channel_id, p.changes || {});
     syncOneChannel(site, token, p.channel_id);   // อัปเดต snapshot ของช่องนี้ให้สด (ไม่รอผล)
+    return r;
+  }
+  // ----- หน้า "รายชื่อธนาคาร" (สวิตช์การดูแลรักษาด้านหน้า) -----
+  // สั่งหลายเว็บพร้อมกัน = หน้าเว็บสร้างงานแยก 1 งาน/เว็บ (ใส่ batch_id เดียวกันใน params) บอททำขนานกันเอง
+  if (a === 'list_site_banks') {
+    return await SITE_BANKS.list(site, token, p.currency);
+  }
+  if (a === 'set_site_banks') {
+    if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนบันทึก');
+    const r = await SITE_BANKS.set(site, token, p.banks, p.all, p.currency);
+    if (p.batch_id) r.batch_id = p.batch_id;
     return r;
   }
   if (a === 'ping') return { ok: true, name: site.name };
@@ -669,7 +786,7 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.7.6 เริ่มทำงาน (แก้ช่องทาง + snapshot + อ่านสถานะแบงก์ต่อประเภทให้ตรงหลังบ้านเป๊ะ)');
+log('🤖 K36 บอทหลังบ้าน v0.8.0 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหน้าบ้านหลายเว็บ)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
