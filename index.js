@@ -312,11 +312,14 @@ const K36 = {
     const raw = await getRawChannel(site, token, channelId);
     const cur = (raw.currencies && (raw.currencies.find(c => c.currency === 'THB') || raw.currencies[0])) || {};
     const pts = cur.paymenttypesetting || {};
-    const enabled = Array.isArray(cur.depositPaymentTypes) ? cur.depositPaymentTypes : Object.keys(pts);
+    const ptcs = cur.paymentTypeChannelStatuses || {};
+    const inList = Array.isArray(cur.depositPaymentTypes) ? cur.depositPaymentTypes : Object.keys(pts);
+    // เปิด/ปิดประเภท = ดูที่ paymentTypeChannelStatuses (sub ใดเปิด = ประเภทเปิด) ถ้าไม่มีค่อย fallback ไป depositPaymentTypes
+    const typeEnabled = code => { const a = ptcs[code]; return (Array.isArray(a) && a.length) ? a.some(x => x && x.enabled) : inList.includes(code); };
     const types = {};
     for (const code of Object.keys(pts)) {
       types[code] = {
-        enabled: enabled.includes(code),
+        enabled: typeEnabled(code),
         min: String(pts[code].mindepositamt ?? ''),
         max: String(pts[code].maxdepositamt ?? ''),
         // ค่าธรรมเนียมของผู้เล่น (% + บาท)
@@ -393,20 +396,18 @@ const K36 = {
       cur.suggestamounts = arr; changed.push('ปุ่มเงินแนะนำ ' + arr.length + ' ปุ่ม');
     }
 
-    // ประเภทการชำระเงิน
+    // ประเภทการชำระเงิน — เปิด/ปิด = พลิก enabled ใน paymentTypeChannelStatuses (เหมือนหลังบ้านจริง)
+    // ไม่เอาประเภทออกจาก depositPaymentTypes / paymenttypesetting (หลังบ้านเก็บไว้ แค่ปิดสวิตช์ sub)
     if (changes.types && typeof changes.types === 'object') {
       const pts = cur.paymenttypesetting || (cur.paymenttypesetting = {});
-      let enabledList = Array.isArray(cur.depositPaymentTypes) ? cur.depositPaymentTypes.slice() : Object.keys(pts).slice();
-      let touchedEnable = false;
-      const toDelete = new Set(); // ประเภทที่สั่งปิด → ลบออกจาก paymenttypesetting
+      const ptcs = cur.paymentTypeChannelStatuses || (cur.paymentTypeChannelStatuses = {});
+      const DEFAULT_SUB = { QR_BANK: 1, PROMPTPAY: 1, TRUEMONEY: 1, DEBIT_CARD: 4, USDT: 2 };
       for (const code of Object.keys(changes.types)) {
         const t = changes.types[code];
-        // อนุญาตเฉพาะรหัสประเภทที่ระบบรู้จัก (กันข้อมูลแปลกปลอม)
-        if (!VALID_PAYTYPES.includes(code)) continue;
-        // ถ้าช่องทางนี้ยังไม่มีประเภทนี้ และผู้ใช้จะเปิดหรือใส่ค่า → สร้างใหม่พร้อมค่าเริ่มต้นครบ
+        if (!VALID_PAYTYPES.includes(code)) continue;   // กันรหัสแปลกปลอม
         const willCreate = !pts[code] && (t.enabled === true || t.min !== undefined || t.max !== undefined);
         if (!pts[code]) {
-          if (!willCreate) continue; // ไม่มี และไม่ได้สั่งเปิด/ใส่ค่า → ข้าม
+          if (!willCreate) continue;
           pts[code] = { mindepositamt: '10', maxdepositamt: '10000', processingfeepct: '0', processingfeeconst: '0', depositfeepct: '0', depositfeeconst: '0' };
           changed.push('สร้าง ' + code);
         }
@@ -418,49 +419,22 @@ const K36 = {
         if (t.dfeeconst !== undefined) { pts[code].depositfeeconst = numStr(t.dfeeconst); changed.push(code + '.บุคคลที่สามบาท'); }
         if (t.enabled !== undefined) {
           const on = !!t.enabled;
-          const has = enabledList.includes(code);
-          if (on && !has) { enabledList.push(code); touchedEnable = true; changed.push('เปิด ' + code); }
-          if (!on) {
-            // ปิด = เอาออกจากทั้ง 2 ที่ (depositPaymentTypes + paymenttypesetting) เหมือนหลังบ้าน
-            if (has) { enabledList = enabledList.filter(c => c !== code); touchedEnable = true; }
-            toDelete.add(code);
-            changed.push('ปิด ' + code);
-          }
+          let arr = ptcs[code];
+          if (!Array.isArray(arr) || !arr.length) arr = ptcs[code] = [{ subPaymentType: (DEFAULT_SUB[code] || 1), enabled: on }];
+          else arr.forEach(x => { if (x && typeof x === 'object') x.enabled = on; });
+          // เปิด = เผื่อยังไม่มีใน depositPaymentTypes ก็ใส่เข้าไป (ตอนปิดไม่เอาออก)
+          if (on && Array.isArray(cur.depositPaymentTypes) && !cur.depositPaymentTypes.includes(code)) cur.depositPaymentTypes.push(code);
+          changed.push((on ? 'เปิด ' : 'ปิด ') + code);
         }
-        // เช็ก min/max เฉพาะประเภทที่ไม่ได้สั่งปิด
-        if (!toDelete.has(code)) {
-          const mn = Number(pts[code].mindepositamt), mx = Number(pts[code].maxdepositamt);
-          if (isFinite(mn) && isFinite(mx) && mx < mn) throw new Error(code + ': ฝากสูงสุดน้อยกว่าขั้นต่ำ');
-        }
-      }
-      // ลบประเภทที่สั่งปิดออกจาก paymenttypesetting ด้วย (หลังบ้านทำแบบนี้)
-      for (const code of toDelete) { if (pts[code]) { delete pts[code]; touchedEnable = true; } }
-      if (touchedEnable) {
-        // ผู้ใช้ตั้งใจเปิด/ปิด → ใช้รายการที่ได้ตรง ๆ (กรองเฉพาะที่มีจริงใน pts หลังลบแล้ว)
-        const existNow = Object.keys(pts);
-        cur.depositPaymentTypes = enabledList.filter(c => existNow.includes(c));
-        cur._dptIntentional = true; // ตั้งใจตั้งค่านี้ อย่าให้ normalize เติมกลับ
+        const mn = Number(pts[code].mindepositamt), mx = Number(pts[code].maxdepositamt);
+        if (isFinite(mn) && isFinite(mx) && mx < mn) throw new Error(code + ': ฝากสูงสุดน้อยกว่าขั้นต่ำ');
       }
     }
 
     if (!changed.length) return { changed: [], note: 'ไม่มีอะไรเปลี่ยน' };
 
-    // สำคัญ: หลังบ้านไม่รับ depositPaymentTypes = null บน PUT ต้องเป็น array เสมอ
-    {
-      const intentional = cur._dptIntentional;
-      delete cur._dptIntentional; // ไม่ส่งฟิลด์ชั่วคราวนี้ไปหลังบ้าน
-      const ptsNow = cur.paymenttypesetting && typeof cur.paymenttypesetting === 'object' ? cur.paymenttypesetting : {};
-      const existingNow = Object.keys(ptsNow);
-      if (!Array.isArray(cur.depositPaymentTypes)) {
-        // ค่าสดเป็น null และผู้ใช้ไม่ได้ตั้งใจแก้ → เปิดทุกประเภทที่มี (เหมือนหน้าเว็บ)
-        cur.depositPaymentTypes = existingNow.slice();
-      } else {
-        // กรองเฉพาะที่มีจริง
-        cur.depositPaymentTypes = cur.depositPaymentTypes.filter(c => existingNow.includes(c));
-        // เติมกลับเฉพาะกรณีที่ "ไม่ได้ตั้งใจปิด" — ถ้าผู้ใช้ตั้งใจปิดจนว่าง ปล่อยให้ว่าง
-        if (!cur.depositPaymentTypes.length && !intentional) cur.depositPaymentTypes = existingNow.slice();
-      }
-    }
+    // กันกรณีค่าสด depositPaymentTypes เป็น null (หลังบ้านไม่รับ null บน PUT) — ไม่งั้นคงค่าเดิมไว้
+    if (!Array.isArray(cur.depositPaymentTypes)) cur.depositPaymentTypes = Object.keys(cur.paymenttypesetting || {});
 
     // ส่งทั้งก้อนกลับเหมือนหน้าเว็บ (merchantinfo/vipids/platform คงเดิมจากค่าสด)
     await boApi(site, token, 'PUT', `/thirdpartypayments/${encodeURIComponent(channelId)}`, raw);
