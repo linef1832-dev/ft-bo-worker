@@ -273,10 +273,16 @@ const VALID_PAYTYPES = ['QR_BANK', 'PROMPTPAY', 'TRUEMONEY', 'DEBIT_CARD', 'USDT
 
 // ดึงค่าดิบของช่องทาง: ลอง THB ก่อน ถ้าพังแบบ 499/UNHANDLED (ชั่วคราว) รอแล้วลองสกุลเดิมซ้ำ 1 ครั้ง
 // แล้วค่อยลอง USDT ให้; error อื่น (เช่น token) โยนทันที ไม่ไล่สกุลต่อ  — ใช้ร่วมทั้ง get/save (กันเขียนซ้ำ)
+// จำว่าช่องไหนดึงได้ด้วยสกุลอะไร (เช่นช่อง USDT) → รอบหน้าขอสกุลนั้นก่อนเลย
+// ไม่ต้องยิง /THB ให้หลังบ้านตอบ 499 ซ้ำทุก 2.5 นาที (เดิม ~288 บรรทัด error/ชม.)
+const chanCurrency = new Map();   // "siteId|channelId" -> 'THB' | 'USDT'
 async function getRawChannel(site, token, channelId) {
   const cid = encodeURIComponent(channelId);
+  const memoKey = site.id + '|' + channelId;
+  const known = chanCurrency.get(memoKey);
+  const order = known ? [known].concat(CURRENCIES.filter(c => c !== known)) : CURRENCIES;
   let raw, lastErr;
-  for (const c of CURRENCIES) {
+  for (const c of order) {
     let got = false;
     for (let attempt = 0; attempt < 2 && !got; attempt++) {
       try { raw = await boApi(site, token, 'GET', `/thirdpartypayments/${cid}/${c}`); lastErr = null; got = true; }
@@ -287,9 +293,9 @@ async function getRawChannel(site, token, channelId) {
         if (attempt === 0) await new Promise(r => setTimeout(r, 400));
       }
     }
-    if (got) break;
+    if (got) { chanCurrency.set(memoKey, c); break; }
   }
-  if (raw === undefined) throw lastErr;
+  if (raw === undefined) { chanCurrency.delete(memoKey); throw lastErr; }
   return raw;
 }
 
@@ -881,7 +887,7 @@ async function scheduleLoop() {
   } finally { schedRunning = false; }
 }
 
-log('🤖 K36 บอทหลังบ้าน v0.9.0 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
+log('🤖 K36 บอทหลังบ้าน v0.9.1 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
