@@ -654,7 +654,7 @@ async function syncLoop() {
 }
 const SYNC_MS = 150 * 1000;   // รีเฟรช snapshot ทุก 2.5 นาที
 
-log('🤖 K36 บอทหลังบ้าน v0.7.2 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + รวมโค้ดดึงค่า/แก้สกุลให้ตรง)');
+log('🤖 K36 บอทหลังบ้าน v0.7.3 เริ่มทำงาน (แก้ช่องทาง + วงจรเร็ว + snapshot + ลบช่องผี + เปิด/ปิดประเภทผ่าน paymentTypeChannelStatuses)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
