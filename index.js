@@ -93,7 +93,7 @@ function decryptCred(site) {
   }
   if (obj.s !== site.id) throw new Error('บัญชีนี้ถูกตั้งไว้ให้เว็บอื่น — ตั้งบัญชีใหม่ใน K36');
   if (!obj.u || !obj.p) throw new Error('บัญชีไม่ครบ');
-  return { userid: obj.u, password: obj.p };
+  return { userid: obj.u, password: obj.p, totp: obj.g || '' };   // g = รหัสลับ Google Authenticator (หลังบ้าน TCG)
 }
 
 // หน้าเว็บส่งรหัสเป็น SHA-1 (ตัวอักษร 40 ตัว) — ถ้าใส่มาเป็นแบบนั้นอยู่แล้วก็ใช้ตรง ๆ
@@ -136,7 +136,12 @@ function boHeaders(site, token) {
 }
 
 // ---------- ล็อกอิน ----------
+const isTcg = site => String(site.platform || '').toLowerCase() === 'tcg';
 async function login(site, cred) {
+  if (isTcg(site)) return tcgLogin(site, cred);
+  return k36Login(site, cred);
+}
+async function k36Login(site, cred) {
   const res = await fetch(site.api_base + '/login', {
     method: 'POST',
     headers: boHeaders(site),
@@ -189,7 +194,7 @@ async function handleSite(site) {
 
     try {
       const r = await login(site, cred);
-      s = { token: r.token, exp: r.exp, cipher: site.cred_cipher };
+      s = { token: r.token, exp: r.exp, cipher: site.cred_cipher, extra: r.extra };
       sessions.set(site.id, s);
       log('✅', site.id, 'ล็อกอินสำเร็จ token หมดอายุ', new Date(r.exp).toISOString());
       await patchSite(site.id, {
@@ -218,7 +223,7 @@ async function ensureToken(site) {
   if (s.token && s.cipher === site.cred_cipher && s.exp - now > 60 * 1000) return s.token;
   const cred = decryptCred(site);
   const r = await login(site, cred);
-  s = { token: r.token, exp: r.exp, cipher: site.cred_cipher };
+  s = { token: r.token, exp: r.exp, cipher: site.cred_cipher, extra: r.extra };
   sessions.set(site.id, s);
   return r.token;
 }
@@ -583,7 +588,315 @@ const SITE_BANKS = {
   }
 };
 
-const PLATFORMS = { k36: K36, tf6: K36, default: K36 };
+
+// ========================================================
+// หลังบ้านแบบ TCG (เช่น NM9)  —  platform = 'tcg'
+//   api_base = https://<โดเมน>/tac/api      web_url = https://<โดเมน>
+// ล็อกอิน 2 ขั้น: POST /login/password → 500 NEED_LOGIN_WITH_OTP → POST /login/otp {operatorName, code}
+//   code = รหัส Google Authenticator 6 หลัก บอทสร้างเองจากรหัสลับ (ตั้งในหน้า FT พร้อมรหัสผ่าน ล็อกด้วยกุญแจเดียวกัน)
+// ทุกคำขอหลังล็อกอินส่ง header: authorization=<token> (ไม่มี Bearer), operatorname, platform, environment, merchant
+// คำตอบห่อแบบ { success, errorCode, message, value }
+// ========================================================
+const TCG_UI_VERSION = '20261117-dd3d4egjkmotv-5fea8e00';
+
+// ----- Google Authenticator (TOTP RFC 6238: SHA1, 6 หลัก, 30 วิ) -----
+function base32Decode(str) {
+  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = String(str || '').toUpperCase().replace(/[\s=-]/g, '');
+  if (!clean || /[^A-Z2-7]/.test(clean)) throw new Error('รหัสลับ Google Authenticator ไม่ถูกต้อง (ต้องเป็นตัว A-Z และ 2-7)');
+  let bits = 0, val = 0; const out = [];
+  for (const ch of clean) { val = (val << 5) | A.indexOf(ch); bits += 5; if (bits >= 8) { out.push((val >>> (bits - 8)) & 255); bits -= 8; } }
+  return Buffer.from(out);
+}
+function totpAt(secret, step) {
+  const msg = Buffer.alloc(8); msg.writeBigUInt64BE(BigInt(step));
+  const h = crypto.createHmac('sha1', base32Decode(secret)).update(msg).digest();
+  const o = h[h.length - 1] & 15;
+  const n = ((h[o] & 127) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3];
+  return String(n % 1000000).padStart(6, '0');
+}
+// รหัสเดียวกันใช้ซ้ำในช่วง 30 วิเดียวกันไม่ได้ (บางระบบนับเป็นผิด) → ถ้าเพิ่งใช้ไป รอรอบถัดไป
+const totpLastStep = new Map();
+async function nextTotp(siteId, secret) {
+  let step = Math.floor(Date.now() / 30000);
+  if (totpLastStep.get(siteId) >= step) {
+    await new Promise(r => setTimeout(r, (step + 1) * 30000 - Date.now() + 300));
+    step = Math.floor(Date.now() / 30000);
+  }
+  totpLastStep.set(siteId, step);
+  return totpAt(secret, step);
+}
+
+function tcgTraceId() {
+  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$!_-';
+  return Array.from(crypto.randomBytes(16), b => A[b % A.length]).join('');
+}
+function tcgHeaders(site, token, extra) {
+  const origin = new URL(site.web_url).origin;
+  const h = {
+    'Content-Type': 'application/json', Accept: 'application/json, text/plain, */*',
+    Origin: origin, Referer: origin + '/', 'User-Agent': UA,
+    authorization: token || 'null', operatorname: (extra && extra.operator) || 'null',
+    language: 'th_TH', customtimezone: 'undefined',
+    platform: (extra && extra.platform) || '', environment: (extra && extra.environment) || '',
+    'tac-trace-id': tcgTraceId(), 'tac-ui-version': TCG_UI_VERSION
+  };
+  if (extra && extra.merchant) { h.merchant = extra.merchant; h.merchantcode = extra.merchant; h.notpending = 'true'; }
+  return h;
+}
+// ยิง API แบบดิบ คืน { status, body }
+async function tcgFetch(site, method, path, body, token, extra) {
+  const res = await fetch(site.api_base + path, {
+    method, headers: tcgHeaders(site, token, extra),
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS), ...boFetchOpts()
+  });
+  const text = await res.text();
+  let data = null; try { data = text ? JSON.parse(text) : null; } catch (e) {}
+  return { status: res.status, data, text };
+}
+const TCG_AUTH_ERR = /TOKEN|NOT_?LOGIN|LOGIN_?EXPIRED|SESSION|UNAUTHORI[ZS]ED|KICK/i;
+
+async function tcgLogin(site, cred) {
+  if (!cred.totp) throw new Error('หลังบ้าน TCG ต้องใส่รหัสลับ Google Authenticator ตอนตั้งบัญชีบอทในหน้า FT');
+  base32Decode(cred.totp);   // เช็ครูปแบบก่อนยิง (กันนับรหัสผิด)
+  const op = cred.userid;
+  // ขั้น 1: รหัสผ่าน
+  const r1 = await tcgFetch(site, 'POST', '/login/password', { operatorName: op, password: cred.password });
+  let resp = r1.data;
+  const ec1 = resp && resp.errorCode;
+  if (!(resp && resp.success && resp.value && resp.value.token)) {
+    if (ec1 !== 'NEED_LOGIN_WITH_OTP') {
+      if (r1.status === 403 && !resp) throw new Error('หลังบ้านไม่ให้เข้า (403) — อาจจำกัด IP: ' + htmlSummary(r1.text));
+      throw new Error('ล็อกอินไม่ผ่าน (' + r1.status + '): ' + ((resp && (resp.message || resp.errorCode)) || htmlSummary(r1.text)));
+    }
+    // ขั้น 2: รหัส Google Authenticator
+    const code = await nextTotp(site.id, cred.totp);
+    const r2 = await tcgFetch(site, 'POST', '/login/otp', { operatorName: op, code });
+    resp = r2.data;
+    if (!(resp && resp.success !== false && resp.token)) {
+      const v = resp && resp.value;
+      if (!(v && v.token)) throw new Error('รหัส Google Authenticator ไม่ผ่าน (' + r2.status + '): ' + ((resp && (resp.message || resp.errorCode)) || htmlSummary(r2.text)) + ' — เช็ครหัสลับที่ตั้งไว้');
+      resp = v;
+    }
+  } else resp = resp.value;
+  let merchant = '';
+  try { const m = JSON.parse(resp.merchants || '[]'); merchant = (m[0] && m[0].merchantCode) || ''; } catch (e) {}
+  if (!merchant) throw new Error('ล็อกอินได้ แต่ไม่พบรหัส merchant ของบัญชีนี้');
+  // TCG ไม่บอกเวลาหมดอายุ → ถือว่าใช้ได้ 6 ชม. (ถ้าโดนตัดก่อน boApi จะล็อกอินใหม่ให้เอง)
+  return { token: resp.token, exp: Date.now() + 6 * 3600 * 1000,
+           extra: { operator: op, merchant, platform: resp.platform || 'TCG', environment: resp.environment || '' } };
+}
+
+// เรียก API หลังล็อกอิน → คืน value ; token ใช้ไม่ได้ → ล็อกอินใหม่แล้วลองซ้ำ 1 ครั้ง
+async function tcgApi(site, token, method, path, body, _retried) {
+  const sess = sessions.get(site.id) || {};
+  const r = await tcgFetch(site, method, path, body, token, sess.extra);
+  const d = r.data;
+  const authFail = r.status === 401 || r.status === 403 || (d && d.success === false && TCG_AUTH_ERR.test(String(d.errorCode || '') + ' ' + String(d.message || '')));
+  if (authFail) {
+    sessions.delete(site.id);
+    log('🔻 tcgApi', site.id, method, path, '→', r.status, (d && (d.errorCode || d.message)) || htmlSummary(r.text));
+    if (!_retried) {
+      try { const fresh = await ensureToken(site); return await tcgApi(site, fresh, method, path, body, true); } catch (e2) {}
+    }
+    const e = new Error('token หลังบ้านใช้ไม่ได้: ' + ((d && (d.message || d.errorCode)) || r.status)); e.httpStatus = 401; throw e;
+  }
+  if (r.status >= 400 || !d || d.success === false) {
+    log('🔻 tcgApi', site.id, method, path, '→', r.status, 'body=' + (r.text || '').slice(0, 220).replace(/\s+/g, ' '));
+    const e = new Error((d && (d.message || d.errorCode)) || ('HTTP ' + r.status)); e.httpStatus = r.status; throw e;
+  }
+  return d.value;
+}
+const tcgMerchant = site => ((sessions.get(site.id) || {}).extra || {}).merchant || '';
+
+// ----- ช่องทางชำระเงิน (บัญชีบุคคลที่สาม) -----
+// แปลงเป็นรูปแบบเดียวกับ K36 ให้หน้า FT ใช้ร่วมกันได้:
+//   status (สถานะช่อง): accountStatus A→1 (เปิด)  I→4 (ปิดการใช้งาน)
+//   supportpayout (ถอน): withdrawConfig.status A/I
+//   types[รหัสประเภท]: depositMethods[] (status, minAmount, maxAmount, ค่าธรรมเนียม)
+const tcgNum = v => (v === null || v === undefined) ? '' : String(v);
+function fmtTcgTime(ms) {   // หน้าเว็บ TCG ส่งเวลาแก้ล่าสุดกลับเป็น 'YYYY-MM-DD HH:mm:ss' เวลา UTC+8
+  if (typeof ms !== 'number') return ms;
+  return new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+}
+// สร้างข้อมูลสำหรับบันทึก จากค่าที่อ่านมา (ทำแบบเดียวกับหน้าเว็บ TCG
+//  แต่พารามิเตอร์ผู้ให้บริการส่ง "ค่าเดิมที่อ่านมา" เสมอ ไม่ใช้ค่าเริ่มต้นแบบหน้าเว็บ)
+function tcgBuildUpdate(raw, merchant) {
+  const p = JSON.parse(JSON.stringify(raw));
+  const ids = a => (a || []).map(x => (x && typeof x === 'object') ? x.paymentLabelId : x);
+  p.depositPaymentLabels = p.depositPaymentLabelMode === 'Y' ? [] : ids(raw.depositPaymentLabels);
+  p.withdrawPaymentLabels = p.withdrawPaymentLabelMode === 'Y' ? [] : ids(raw.withdrawPaymentLabels);
+  const params = (raw.thirdPartyParameters && raw.thirdPartyParameters.params) || [];
+  p.thirdPartyParameters = params.map(x => ({
+    id: x.id, paramKeyName: x.paramKeyName, paramThirdParty: x.paramThirdParty,
+    paramValue: (typeof x.paramValue === 'string' && /^\*+$/.test(x.paramValue)) ? null : x.paramValue,   // ค่าลับที่ถูกซ่อน (****) → null = ไม่แก้
+    defaultValue: x.defaultValue, isDisplay: x.isDisplay, remarks: x.remarks, sensitivityLevel: x.sensitivityLevel
+  }));
+  p.lastUpdatedTime = fmtTcgTime(raw.lastUpdatedTime);
+  p.qrImages = Array.isArray(raw.qrImages) ? raw.qrImages : [];
+  p.merchantCode = merchant;
+  return p;
+}
+async function tcgListRaw(site, token, status) {
+  const v = await tcgApi(site, token, 'POST', '/relay/post/mcs-internal-v3-bankaccount-thirdparty-searchByPost',
+    { merchantCode: tcgMerchant(site), accountStatus: status, page: { size: 500, page: 1, pageable: false } });
+  return (v && v.list) || [];
+}
+const TCG = {
+  async listChannels(site, token) {
+    // หน้าเว็บกรอง accountStatus ทีละค่า → ขอทั้งเปิด (A) และปิด (I) แล้วรวม ไม่ให้ช่องที่ปิดไว้หายจากรายการ
+    const [a, i] = await Promise.all([tcgListRaw(site, token, 'A'), tcgListRaw(site, token, 'I').catch(() => [])]);
+    const seen = new Map();
+    for (const x of a.concat(i)) if (x && x.bankAccountId != null && !seen.has(x.bankAccountId)) seen.set(x.bankAccountId, x);
+    return [...seen.values()].map(x => ({ id: String(x.bankAccountId), code: x.displayAccountNumber || x.channelName, name: x.channelName, staticname: x.bankName || '' }));
+  },
+  async getRaw(site, token, channelId) {
+    const q = new URLSearchParams({ bankAccountId: String(channelId), merchantCode: tcgMerchant(site) });
+    const raw = await tcgApi(site, token, 'GET', '/relay/get/mcs-bankaccount-thirdparty-get?' + q);
+    if (!raw || !Array.isArray(raw.depositMethods)) throw new Error('อ่านข้อมูลช่องทางไม่ได้');
+    return raw;
+  },
+  async getChannel(site, token, channelId) {
+    const raw = await TCG.getRaw(site, token, channelId);
+    const wc = raw.withdrawConfig || {};
+    const types = {};
+    for (const m of raw.depositMethods) {
+      const code = (m.bankTypes || []).join('+'); if (!code) continue;
+      types[code] = {
+        enabled: m.status === 'A', min: tcgNum(m.minAmount), max: tcgNum(m.maxAmount),
+        pfeepct: tcgNum(m.playerCharge ?? 0), pfeeconst: tcgNum(m.playerChargeFixed ?? 0),
+        dfeepct: tcgNum(m.vendorCharge ?? 0), dfeeconst: tcgNum(m.vendorChargeFixed ?? 0),
+        amounts: Array.isArray(m.fixedAmounts) ? m.fixedAmounts.slice() : []
+      };
+    }
+    return {
+      raw, platform: 'tcg',
+      id: String(raw.bankAccountId), code: raw.displayAccountNumber || raw.channelName, name: raw.channelName || '',
+      currency: 'THB',
+      status: raw.accountStatus === 'A' ? 1 : 4,
+      supportpayout: wc.status === 'A',
+      readonly: { updatedby: raw.lastUpdatedBy, updatedat: raw.lastUpdatedTime },
+      values: {
+        maxdailyamt: tcgNum(raw.dailyDepositLimit), maxtotalamt: tcgNum(raw.depositBalanceLimit),
+        minpayoutamt: tcgNum(wc.minAmount), maxpayoutamt: tcgNum(wc.maxAmount),
+        payoutfeepct: tcgNum(wc.vendorCharge ?? 0), payoutfeeconst: tcgNum(wc.vendorChargeFixed ?? 0),
+        remark: String(raw.remarks ?? ''), amountsuggest: false, suggestamounts: [], types
+      }
+    };
+  },
+  async saveChannel(site, token, channelId, changes) {
+    const raw = await TCG.getRaw(site, token, channelId);
+    const changed = [];
+    const num = v => { const n = String(v).replace(/[, ]/g, ''); if (!/^\d+(\.\d+)?$/.test(n)) throw new Error('ค่าตัวเลขไม่ถูกต้อง: ' + v); return Number(n); };
+    const numOrNull = v => (String(v).trim() === '' ? null : num(v));
+    if (changes.status !== undefined) {
+      const st = Number(changes.status);
+      if (st === 2) throw new Error('หลังบ้าน TCG ไม่มีสถานะ "สำรอง"');
+      if (![1, 4, 8].includes(st)) throw new Error('สถานะไม่ถูกต้อง');
+      const v = st === 1 ? 'A' : 'I';
+      if (raw.accountStatus !== v) { raw.accountStatus = v; changed.push('สถานะช่อง=' + (v === 'A' ? 'เปิด' : 'ปิด')); }
+    }
+    const wc = raw.withdrawConfig || (raw.withdrawConfig = {});
+    if (changes.supportpayout !== undefined) {
+      const v = changes.supportpayout ? 'A' : 'I';
+      if (wc.status !== v) { wc.status = v; changed.push('สถานะถอน=' + (v === 'A' ? 'เปิด' : 'ปิด')); }
+    }
+    if (changes.maxdailyamt !== undefined) { raw.dailyDepositLimit = numOrNull(changes.maxdailyamt); changed.push('วงเงินฝากต่อวัน=' + (raw.dailyDepositLimit ?? 'ไม่จำกัด')); }
+    if (changes.maxtotalamt !== undefined) { raw.depositBalanceLimit = numOrNull(changes.maxtotalamt); changed.push('วงเงินยอดคงเหลือ=' + (raw.depositBalanceLimit ?? 'ไม่จำกัด')); }
+    if (changes.minpayoutamt !== undefined) { wc.minAmount = num(changes.minpayoutamt); changed.push('ถอนขั้นต่ำ=' + wc.minAmount); }
+    if (changes.maxpayoutamt !== undefined) { wc.maxAmount = num(changes.maxpayoutamt); changed.push('ถอนสูงสุด=' + wc.maxAmount); }
+    if (changes.payoutfeepct !== undefined) { wc.vendorCharge = num(changes.payoutfeepct); changed.push('ค่าธรรมเนียมถอน%=' + wc.vendorCharge); }
+    if (changes.payoutfeeconst !== undefined) { wc.vendorChargeFixed = num(changes.payoutfeeconst); changed.push('ค่าธรรมเนียมถอนบาท=' + wc.vendorChargeFixed); }
+    if (wc.minAmount != null && wc.maxAmount != null && wc.maxAmount && wc.maxAmount < wc.minAmount) throw new Error('ถอนสูงสุดน้อยกว่าขั้นต่ำ');
+    if (changes.remark !== undefined) { raw.remarks = String(changes.remark) || null; changed.push('หมายเหตุ'); }
+    if (changes.suggestamounts !== undefined && JSON.stringify(changes.suggestamounts) !== '[]') throw new Error('หลังบ้าน TCG ตั้งปุ่มจำนวนเงินแยกรายประเภท — ยังไม่รองรับจากหน้านี้');
+    if (changes.types && typeof changes.types === 'object') {
+      for (const code of Object.keys(changes.types)) {
+        const t = changes.types[code] || {};
+        const m = raw.depositMethods.find(x => (x.bankTypes || []).join('+') === code);
+        if (!m) throw new Error('ช่องนี้ไม่มีประเภท ' + code + ' (หลังบ้าน TCG เพิ่มประเภทจากบอทไม่ได้)');
+        if (t.enabled !== undefined) { const v = t.enabled ? 'A' : 'I'; if (m.status !== v) { m.status = v; changed.push((t.enabled ? 'เปิด ' : 'ปิด ') + code); } }
+        if (t.min !== undefined) { m.minAmount = num(t.min); changed.push(code + '.min=' + m.minAmount); }
+        if (t.max !== undefined) { m.maxAmount = num(t.max); changed.push(code + '.max=' + m.maxAmount); }
+        if (t.pfeepct !== undefined) { m.playerCharge = num(t.pfeepct); changed.push(code + '.ผู้เล่น%'); }
+        if (t.pfeeconst !== undefined) { m.playerChargeFixed = num(t.pfeeconst); changed.push(code + '.ผู้เล่นบาท'); }
+        if (t.dfeepct !== undefined) { m.vendorCharge = num(t.dfeepct); changed.push(code + '.บุคคลที่สาม%'); }
+        if (t.dfeeconst !== undefined) { m.vendorChargeFixed = num(t.dfeeconst); changed.push(code + '.บุคคลที่สามบาท'); }
+        if (m.maxAmount && m.maxAmount < m.minAmount) throw new Error(code + ': ฝากสูงสุดน้อยกว่าขั้นต่ำ');
+      }
+    }
+    if (!changed.length) return { changed: [], note: 'ไม่มีอะไรเปลี่ยน' };
+    await tcgApi(site, token, 'POST', '/relay/post/mcs-bankaccount-thirdparty-update', tcgBuildUpdate(raw, tcgMerchant(site)));
+    return { changed };
+  }
+};
+
+// ----- เปิด/ปิดธนาคาร = "วิธีถอน" (isWithdrawActive Y/N) — บันทึกทั้งรายการในคำขอเดียว -----
+async function tcgWithdrawMethods(site, token) {
+  const v = await tcgApi(site, token, 'GET', '/relay/get/mcs-v3-bankcard-setting-withdrawMethod-get');
+  if (!Array.isArray(v)) throw new Error('อ่านรายการธนาคารถอนไม่ได้');
+  return v;
+}
+function normTcgBank(x) {
+  const open = x.isWithdrawActive === 'Y';
+  return {
+    bankid: x.withdrawMethodGroup + ':' + x.bankId, name: x.bankEnName || x.bankChName || x.bankCode,
+    namesc: x.bankCode || '', currency: x.currency || 'THB', paymenttype: x.groupName,
+    status: open ? BANK_ST_NORMAL : BANK_ST_MAINT, maintenance: !open, open, togglable: true,
+    image: x.bankIcon || '', url: ''
+  };
+}
+const TCG_BANKS = {
+  async list(site, token) {
+    const rows = (await tcgWithdrawMethods(site, token)).map(normTcgBank);
+    return { site_id: site.id, banks: rows, total: rows.length, open: rows.filter(b => b.open).length, closed: rows.filter(b => b.maintenance).length };
+  },
+  async set(site, token, banks, all) {
+    const [raw, bind] = await Promise.all([
+      tcgWithdrawMethods(site, token),
+      tcgApi(site, token, 'GET', '/relay/get/mcs-v3-bankcard-setting-bindRestriction-get')
+    ]);
+    if (!raw.length) throw new Error('ไม่พบรายชื่อธนาคารในหลังบ้าน');
+    const cur = raw.map(normTcgBank);
+    const byId = new Map(cur.map((b, i) => [b.bankid, i])), byName = new Map();
+    cur.forEach((b, i) => { for (const n of [b.name, b.namesc]) if (n) byName.set(bankKey(n), i); });
+    const want = new Map(); const notFound = [];
+    if (all === true || all === false) cur.forEach((b, i) => want.set(i, all));
+    else {
+      if (!Array.isArray(banks) || !banks.length) throw new Error('ไม่ได้ระบุธนาคารที่จะเปิด/ปิด');
+      for (const x of banks) {
+        let i;
+        if (x && x.bankid != null) i = byId.get(String(x.bankid));
+        if (i === undefined && x && x.name) i = byName.get(bankKey(x.name));
+        if (i === undefined) { notFound.push((x && (x.name || x.bankid)) || '?'); continue; }
+        want.set(i, !!x.open);
+      }
+    }
+    const diff = [...want].filter(([i, open]) => cur[i].open !== open);
+    if (diff.length) {
+      for (const [i, open] of diff) raw[i].isWithdrawActive = open ? 'Y' : 'N';
+      const body = {
+        withdrawBankCardSetting: { allowedWithdrawMethodType: (bind && bind.allowedWithdrawMethodType) ?? null,
+                                   hasBindCardRestriction: (bind && bind.hasBindCardRestriction) || 'Y', merchantCode: tcgMerchant(site) },
+        withdrawMethodSettings: raw.map((x, i) => Object.assign({}, x, { index: i, key: x.bankCode + '_' + (i + 1), group: x.withdrawMethodGroup }))
+      };
+      await tcgApi(site, token, 'POST', '/relay/post/mcs-v3-bankcard-setting-withdrawMethod-save', body);
+    }
+    // อ่านกลับเพื่อยืนยันค่าจริง
+    const after = diff.length ? (await tcgWithdrawMethods(site, token)).map(normTcgBank) : cur;
+    const afterById = new Map(after.map(b => [b.bankid, b]));
+    const changed = [], notApplied = [];
+    for (const [i, open] of diff) {
+      const b = afterById.get(cur[i].bankid);
+      if (b && b.open === open) changed.push((open ? 'เปิด ' : 'ปิด ') + cur[i].name); else notApplied.push(cur[i].name);
+    }
+    if (diff.length && !changed.length) throw new Error('เปิด/ปิดธนาคารไม่สำเร็จ: ' + notApplied.join(' | '));
+    return { site_id: site.id, changed, banks: after, not_found: notFound, skipped: [], failed: [], not_applied: notApplied };
+  }
+};
+
+const PLATFORMS = { k36: K36, tf6: K36, tcg: TCG, default: K36 };
 function platformOf(site) { return PLATFORMS[site.platform] || PLATFORMS.default; }
 
 // ---------- จัดการคิวงาน bo_tasks ----------
@@ -636,12 +949,13 @@ async function runTask(site, token, task) {
   }
   // ----- หน้า "รายชื่อธนาคาร" (สวิตช์การดูแลรักษาด้านหน้า) -----
   // สั่งหลายเว็บพร้อมกัน = หน้าเว็บสร้างงานแยก 1 งาน/เว็บ (ใส่ batch_id เดียวกันใน params) บอททำขนานกันเอง
+  const BANKS = isTcg(site) ? TCG_BANKS : SITE_BANKS;
   if (a === 'list_site_banks') {
-    return await SITE_BANKS.list(site, token, p.currency);
+    return await BANKS.list(site, token, p.currency);
   }
   if (a === 'set_site_banks') {
     if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนบันทึก');
-    const r = await SITE_BANKS.set(site, token, p.banks, p.all, p.currency);
+    const r = await BANKS.set(site, token, p.banks, p.all, p.currency);
     if (p.batch_id) r.batch_id = p.batch_id;
     return r;
   }
@@ -690,7 +1004,7 @@ async function loop() {
   if (running) return;
   running = true;
   try {
-    const sites = await sb('GET', 'bo_sites?enabled=eq.true&select=id,name,web_url,api_base,cred_cipher,cipher_fp');
+    const sites = await sb('GET', 'bo_sites?enabled=eq.true&select=id,name,web_url,api_base,cred_cipher,cipher_fp,platform');
     const ids = new Set(sites.map(s => s.id));
     for (const id of sessions.keys()) if (!ids.has(id)) sessions.delete(id);
     for (const id of fastSiteCache.keys()) if (!ids.has(id)) fastSiteCache.delete(id);   // ล้างเว็บที่ปิด/ลบ ไม่ให้ค้าง
@@ -896,7 +1210,7 @@ async function scheduleLoop() {
   } finally { schedRunning = false; }
 }
 
-log('🤖 K36 บอทหลังบ้าน v0.9.2 เริ่มทำงาน (แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
+log('🤖 K36 บอทหลังบ้าน v1.0.0 เริ่มทำงาน (K36 + TCG · แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
