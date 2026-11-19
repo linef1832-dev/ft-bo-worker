@@ -768,7 +768,8 @@ const TCG = {
         enabled: m.status === 'A', min: tcgNum(m.minAmount), max: tcgNum(m.maxAmount),
         pfeepct: tcgNum(m.playerCharge ?? 0), pfeeconst: tcgNum(m.playerChargeFixed ?? 0),
         dfeepct: tcgNum(m.vendorCharge ?? 0), dfeeconst: tcgNum(m.vendorChargeFixed ?? 0),
-        amounts: Array.isArray(m.fixedAmounts) ? m.fixedAmounts.slice() : []
+        amounts: Array.isArray(m.fixedAmounts) ? m.fixedAmounts.slice() : [],
+        fixed: m.fixedAmount === 'Y', fixedonly: m.fixedAmountOnly === 'Y'   // จำนวนเงินที่กำหนด / จำนวนที่กำหนดเท่านั้น
       };
     }
     return {
@@ -824,6 +825,16 @@ const TCG = {
         if (t.pfeeconst !== undefined) { m.playerChargeFixed = num(t.pfeeconst); changed.push(code + '.ผู้เล่นบาท'); }
         if (t.dfeepct !== undefined) { m.vendorCharge = num(t.dfeepct); changed.push(code + '.บุคคลที่สาม%'); }
         if (t.dfeeconst !== undefined) { m.vendorChargeFixed = num(t.dfeeconst); changed.push(code + '.บุคคลที่สามบาท'); }
+        if (t.amounts !== undefined) {
+          if (!Array.isArray(t.amounts)) throw new Error(code + ': รายการจำนวนเงินไม่ถูกต้อง');
+          const arr = [...new Set(t.amounts.map(num))].filter(n => n > 0).sort((a, b) => a - b);
+          if (arr.length > 50) throw new Error(code + ': ปุ่มจำนวนเงินมากเกิน 50 ปุ่ม');
+          if (JSON.stringify(arr) !== JSON.stringify(m.fixedAmounts || [])) { m.fixedAmounts = arr; changed.push(code + '.ปุ่มเงิน=' + (arr.join(',') || 'ว่าง')); }
+        }
+        if (t.fixed !== undefined) { const v = t.fixed ? 'Y' : 'N'; if (m.fixedAmount !== v) { m.fixedAmount = v; changed.push(code + '.ปุ่มจำนวนเงิน=' + (t.fixed ? 'เปิด' : 'ปิด')); } }
+        if (t.fixedonly !== undefined) { const v = t.fixedonly ? 'Y' : 'N'; if (m.fixedAmountOnly !== v) { m.fixedAmountOnly = v; changed.push(code + '.เฉพาะจำนวนที่กำหนด=' + (t.fixedonly ? 'เปิด' : 'ปิด')); } }
+        if (m.fixedAmount === 'Y' && !(m.fixedAmounts || []).length) throw new Error((TCG_TYPE_NAME[code] || code) + ': เปิดปุ่มจำนวนเงินแต่ยังไม่มีจำนวนเงินสักปุ่ม');
+        if (m.fixedAmountOnly === 'Y' && !(m.fixedAmounts || []).length) throw new Error((TCG_TYPE_NAME[code] || code) + ': "จำนวนที่กำหนดเท่านั้น" ต้องมีจำนวนเงินอย่างน้อย 1 ปุ่ม');
         if (m.maxAmount && m.maxAmount < m.minAmount) throw new Error(code + ': ฝากสูงสุดน้อยกว่าขั้นต่ำ');
       }
     }
@@ -1230,7 +1241,7 @@ async function scheduleLoop() {
   } finally { schedRunning = false; }
 }
 
-log('🤖 K36 บอทหลังบ้าน v1.0.2 เริ่มทำงาน (K36 + TCG · แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
+log('🤖 K36 บอทหลังบ้าน v1.0.3 เริ่มทำงาน (K36 + TCG · แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
