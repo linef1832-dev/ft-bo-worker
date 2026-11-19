@@ -715,6 +715,7 @@ const tcgMerchant = site => ((sessions.get(site.id) || {}).extra || {}).merchant
 //   status (สถานะช่อง): accountStatus A→1 (เปิด)  I→4 (ปิดการใช้งาน)
 //   supportpayout (ถอน): withdrawConfig.status A/I
 //   types[รหัสประเภท]: depositMethods[] (status, minAmount, maxAmount, ค่าธรรมเนียม)
+const TCG_TYPE_NAME = { TRUEMONEY: 'TrueMoney', QBT: 'โอนเงินผ่านธนาคารด่วน', PGMTB: 'การโอนเงินผ่าน QR ของธนาคาร', IPQR: 'PromptPay', TBQR: 'สแกน QR CODE เติมเงิน', PROMPTPAY: 'PROMPTPAY', TW: 'True Wallet' };
 const tcgNum = v => (v === null || v === undefined) ? '' : String(v);
 function fmtTcgTime(ms) {   // หน้าเว็บ TCG ส่งเวลาแก้ล่าสุดกลับเป็น 'YYYY-MM-DD HH:mm:ss' เวลา UTC+8
   if (typeof ms !== 'number') return ms;
@@ -827,6 +828,12 @@ const TCG = {
       }
     }
     if (!changed.length) return { changed: [], note: 'ไม่มีอะไรเปลี่ยน' };
+    // หลังบ้าน TCG ไม่ยอมให้เปิดประเภทที่ "ฝากสูงสุด" = 0 → แจ้งเป็นภาษาไทยก่อนส่ง
+    for (const m of raw.depositMethods) {
+      if (m.status !== 'A' || Number(m.maxAmount) > 0) continue;
+      const code = (m.bankTypes || []).join('+');
+      throw new Error('เปิด ' + (TCG_TYPE_NAME[code] || code) + ' ไม่ได้: ยังไม่ได้ตั้ง "ฝากสูงสุด" (ตอนนี้ 0) — ใส่ฝากขั้นต่ำ/สูงสุดของประเภทนี้ก่อน แล้วเปิดพร้อมกันในครั้งเดียว');
+    }
     await tcgApi(site, token, 'POST', '/relay/post/mcs-bankaccount-thirdparty-update', tcgBuildUpdate(raw, tcgMerchant(site)));
     return { changed };
   }
@@ -838,11 +845,24 @@ async function tcgWithdrawMethods(site, token) {
   if (!Array.isArray(v)) throw new Error('อ่านรายการธนาคารถอนไม่ได้');
   return v;
 }
+// รหัสธนาคารของ TCG → ชื่อแบบหลังบ้าน K36 (banknameen) ให้หน้า FT รวมเป็นแถวเดียวกัน
+// สั่ง "ปิด Bangkok Bank" ครั้งเดียว = ปิดทั้งเว็บ K36 และ TCG · ชื่อเดิม (ไทย) ยังใช้สั่งได้
+const TCG_BANK_NAME = {
+  BKKBTHBK: 'Bangkok Bank', KKB: 'Kasikorn Bank', SCB: 'Siam Commercial Bank', Krungsri: 'Bank of Ayudhya',
+  GSB: 'Government Savings Bank', TMB: 'TMBThanachart Bank', KRTHTHBK: 'Krung Thai Bank', CIMBTH: 'CIMB Thai',
+  UOBTH: 'UOB Bank', BAAC: 'Bank for Agriculture and Agricultural Cooperatives', KKB2: 'Kiatnakin Bank',
+  TISCO: 'Tisco Bank', BOCTH: 'Bank of China', ICBCTH: 'Industrial and Commercial Bank of China Limited',
+  GHB: 'Government Housing Bank', HSBCTH: 'HSBC', LHBANK: 'Land And Houses Bank',
+  SCBTH: 'STANDARD CHARTERED BANK (THAI)', MegaTH: 'Mega International Commercial Bank', TCRB: 'Thai Credit Bank',
+  ISBT: 'Islamic Bank of Thailand', SMBCTH: 'Sumitomo Mitsui Banking Corporation', MHCBTH: 'MIZUHO CORPORATE BANK, LTD.',
+  DBBKTH: 'Deutsche Bank', THB_CITI: 'Citibank Thailand', THB_EXIM: 'Export-Import Bank of Thailand', THB_SME: 'SME BANK'
+};
 function normTcgBank(x) {
   const open = x.isWithdrawActive === 'Y';
+  const local = x.bankEnName || x.bankChName || x.bankCode;
   return {
-    bankid: x.withdrawMethodGroup + ':' + x.bankId, name: x.bankEnName || x.bankChName || x.bankCode,
-    namesc: x.bankCode || '', currency: x.currency || 'THB', paymenttype: x.groupName,
+    bankid: x.withdrawMethodGroup + ':' + x.bankId, name: TCG_BANK_NAME[x.bankCode] || local,
+    namesc: local, code: x.bankCode || '', currency: x.currency || 'THB', paymenttype: x.groupName,
     status: open ? BANK_ST_NORMAL : BANK_ST_MAINT, maintenance: !open, open, togglable: true,
     image: x.bankIcon || '', url: ''
   };
@@ -860,7 +880,7 @@ const TCG_BANKS = {
     if (!raw.length) throw new Error('ไม่พบรายชื่อธนาคารในหลังบ้าน');
     const cur = raw.map(normTcgBank);
     const byId = new Map(cur.map((b, i) => [b.bankid, i])), byName = new Map();
-    cur.forEach((b, i) => { for (const n of [b.name, b.namesc]) if (n) byName.set(bankKey(n), i); });
+    cur.forEach((b, i) => { for (const n of [b.name, b.namesc, b.code]) if (n) byName.set(bankKey(n), i); });
     const want = new Map(); const notFound = [];
     if (all === true || all === false) cur.forEach((b, i) => want.set(i, all));
     else {
@@ -1210,7 +1230,7 @@ async function scheduleLoop() {
   } finally { schedRunning = false; }
 }
 
-log('🤖 K36 บอทหลังบ้าน v1.0.0 เริ่มทำงาน (K36 + TCG · แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
+log('🤖 K36 บอทหลังบ้าน v1.0.2 เริ่มทำงาน (K36 + TCG · แก้ช่องทาง + snapshot + เปิด/ปิดธนาคารหลายเว็บ + ตั้งเวลา)');
 loop();
 setInterval(loop, LOOP_MS);
 setInterval(fastLoop, FAST_POLL_MS);
