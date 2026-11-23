@@ -310,7 +310,8 @@ function findOrderNo(obj, code) {
 // เขียนลงชีตผ่าน Google Apps Script webhook (ไม่ให้พังการฝากถ้าชีตมีปัญหา)
 async function writeSheet(p, dep) {
   const url = process.env.SHEET_WEBHOOK_URL, secret = process.env.SHEET_WEBHOOK_SECRET || '';
-  if (!url || !p.sheet) return null;
+  if (!url) { log('🧾 sheet: ไม่ได้ตั้ง SHEET_WEBHOOK_URL'); return null; }
+  if (!p.sheet) { log('🧾 sheet: ไม่มีข้อมูลชีตจากเว็บ (p.sheet ว่าง — เว็บอาจเป็นเวอร์ชันเก่า)'); return null; }
   const s = p.sheet;
   // ส่งเป็น query param (Apps Script อ่านจาก e.parameter ได้ชัวร์ — ไม่โดนตัดตอน redirect เหมือน body)
   const qs = new URLSearchParams({
@@ -322,6 +323,7 @@ async function writeSheet(p, dep) {
   const full = url + (url.indexOf('?') >= 0 ? '&' : '?') + qs;
   const res = await fetch(full, { method: 'GET', signal: AbortSignal.timeout(15000), redirect: 'follow' });
   const txt = await res.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
+  log('🧾 sheet', s.web, s.date, '→ HTTP', res.status, '·', (txt || '').slice(0, 160).replace(/\s+/g, ' '));
   return j || { ok: res.ok, raw: (txt || '').slice(0, 160) };
 }
 
