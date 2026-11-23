@@ -272,6 +272,30 @@ async function boApi(site, token, method, path, body, _retried) {
   return data;
 }
 
+// POST แบบ multipart/form-data (ใช้กับฝากมือเข้ายูส /deposits/thirdParty) + ล็อกอินใหม่ลองซ้ำ 1 ครั้งถ้า token มีปัญหา
+async function boApiForm(site, token, path, fields, _retried) {
+  const url = site.api_base + path;
+  const origin = new URL(site.web_url).origin;
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v == null ? '' : String(v));
+  const headers = { Accept: 'application/json, text/plain, */*', Origin: origin, Referer: origin + '/', 'User-Agent': UA, 'x-currency': 'THB' };
+  if (token) headers.Authorization = token;
+  const res = await fetch(url, { method: 'POST', headers, body: fd, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS), ...boFetchOpts() });
+  const text = await res.text();
+  let data = null; try { data = text ? JSON.parse(text) : null; } catch (e) {}
+  const authFail = AUTH_FAIL_STATUS.includes(res.status);
+  if (authFail) sessions.delete(site.id);
+  if (!res.ok) {
+    log('🔻 boApiForm', site.id, 'POST', path, '→', res.status, 'body=' + (text || '').slice(0, 220).replace(/\s+/g, ' '));
+    if (authFail && !_retried) {
+      try { const fresh = await ensureToken(site); return await boApiForm(site, fresh, path, fields, true); } catch (e2) {}
+    }
+    const why = (data && (data.message || data.error || data.msg)) || ('HTTP ' + res.status);
+    const e = new Error(why); e.httpStatus = res.status; throw e;
+  }
+  return data;
+}
+
 // ========================================================
 // ความสามารถของ "ระบบหลังบ้านแบบ K36 (tf6prod-ims)"
 // งานช่องทางชำระเงิน: list / get / save
@@ -327,6 +351,32 @@ const K36 = {
       lastWithdraw: d.lastwithdrawtime || null,
       banks: Array.isArray(d.playerbankinfo) ? d.playerbankinfo.map(b => ({ bankname: b.bankname || '', paymentid: b.paymentid || '' })) : []
     };
+  },
+
+  // ฝากมือเข้ายูส (เงินฝากผ่านบุคคลที่สาม) — ฝากเข้าตรง status=2
+  async deposit(site, token, p) {
+    const amt = Number(p.amount);
+    if (!p.playerid) throw new Error('ไม่ได้ระบุรหัสสมาชิก');
+    if (!(amt > 0)) throw new Error('จำนวนเงินไม่ถูกต้อง');
+    if (!p.channelid || !p.channelcode) throw new Error('ไม่ได้เลือกบัญชี/บุคคลที่สาม');
+    if (!p.paytype) throw new Error('ไม่ได้เลือกประเภทการชำระเงิน');
+    if (!p.bankcode) throw new Error('ไม่ได้เลือกช่องทางการชำระเงิน');
+    if (!p.orderno) throw new Error('ไม่ได้ใส่หมายเลขออร์เดอร์');
+    const fields = {
+      playerid: String(p.playerid).trim(),
+      depositamt: amt,
+      thirdPartyRemoteOrderNo: String(p.orderno).trim(),
+      remarks: p.remarks || '',
+      thirdpartypaymentbankcode: p.bankcode,
+      depositPaymentTypeEnum: p.paytype,
+      thirdpartypaymentcode: p.channelcode,
+      thirdpartypaymentid: p.channelid,
+      currency: 'THB',
+      status: 2,                 // ฝากเข้าตรง (ข้ามขั้นตอนตรวจสอบ)
+      requesttime: Date.now()
+    };
+    const d = await boApiForm(site, token, '/deposits/thirdParty', fields);
+    return { ok: true, playerid: fields.playerid, amount: amt, orderno: fields.thirdPartyRemoteOrderNo, result: d || null };
   },
 
   // ดึงรายชื่อช่องทางทั้งหมด
@@ -1017,6 +1067,11 @@ async function runTask(site, token, task) {
     if (!p.playerid) throw new Error('ไม่ได้ระบุรหัสสมาชิก');
     if (typeof P.playerInfo !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับการค้นยูส');
     return await P.playerInfo(site, token, String(p.playerid).trim());
+  }
+  if (a === 'deposit_player') {
+    if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนฝาก');
+    if (typeof P.deposit !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับการฝากเข้ายูส');
+    return await P.deposit(site, token, p);
   }
   if (a === 'ping') return { ok: true, name: site.name };
   throw new Error('ไม่รู้จักคำสั่ง: ' + a);
