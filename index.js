@@ -296,6 +296,35 @@ async function boApiForm(site, token, path, fields, _retried) {
   return data;
 }
 
+// หาเลขออร์เดอร์หลังบ้าน (เช่น TF6N883OK28166...) จากผลลัพธ์ฝาก — ไล่หา string ที่มีรหัสช่อง + ตัวเลขยาว
+function findOrderNo(obj, code) {
+  let found = null;
+  const walk = o => {
+    if (found || o == null) return;
+    if (typeof o === 'string') { if (code && o.indexOf(code) >= 0 && /\d{6,}/.test(o)) found = o; return; }
+    if (typeof o === 'object') { for (const k in o) { if (found) break; walk(o[k]); } }
+  };
+  walk(obj); return found;
+}
+
+// เขียนลงชีตผ่าน Google Apps Script webhook (ไม่ให้พังการฝากถ้าชีตมีปัญหา)
+async function writeSheet(p, dep) {
+  const url = process.env.SHEET_WEBHOOK_URL, secret = process.env.SHEET_WEBHOOK_SECRET || '';
+  if (!url || !p.sheet) return null;
+  const s = p.sheet;
+  const payload = {
+    secret, web: s.web, date: s.date,
+    values: {
+      account: s.account || '', orderBO: dep.orderBO || '', user: p.playerid,
+      sheetAmt: (s.sheetAmt == null ? '' : s.sheetAmt), amount: dep.amount,
+      staff: s.staff || '', noteBD: p.orderno || ''
+    }
+  };
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(15000), redirect: 'follow' });
+  const txt = await res.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
+  return j || { ok: res.ok, raw: (txt || '').slice(0, 160) };
+}
+
 // ========================================================
 // ความสามารถของ "ระบบหลังบ้านแบบ K36 (tf6prod-ims)"
 // งานช่องทางชำระเงิน: list / get / save
@@ -376,7 +405,7 @@ const K36 = {
       requesttime: Date.now()
     };
     const d = await boApiForm(site, token, '/deposits/thirdParty', fields);
-    return { ok: true, playerid: fields.playerid, amount: amt, orderno: fields.thirdPartyRemoteOrderNo, result: d || null };
+    return { ok: true, playerid: fields.playerid, amount: amt, orderno: fields.thirdPartyRemoteOrderNo, orderBO: findOrderNo(d, p.channelcode) || '', result: d || null };
   },
 
   // ดึงข้อมูลสำหรับ 3 dropdown ของฟอร์มฝาก: ประเภทที่เปิด + แบงก์ของแต่ละประเภท
@@ -1099,7 +1128,9 @@ async function runTask(site, token, task) {
   if (a === 'deposit_player') {
     if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนฝาก');
     if (typeof P.deposit !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับการฝากเข้ายูส');
-    return await P.deposit(site, token, p);
+    const dep = await P.deposit(site, token, p);
+    try { const sr = await writeSheet(p, dep); if (sr) dep.sheet = sr; } catch (e) { dep.sheet = { ok: false, error: e.message || String(e) }; }
+    return dep;
   }
   if (a === 'ping') return { ok: true, name: site.name };
   throw new Error('ไม่รู้จักคำสั่ง: ' + a);
