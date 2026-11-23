@@ -390,7 +390,13 @@ const K36 = {
       let banks = [];
       try {
         const b = await boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(channelId)}&depositPaymentTypeEnum=${encodeURIComponent(code)}&currency=THB`);
-        banks = (Array.isArray(b) ? b : []).filter(x => x && x.isenabled !== false).map(x => ({ code: x.thirdpartypaymentbankcode, name: x.bankname || x.thirdpartypaymentbankcode }));
+        const bname = x => {
+          const n = x.bankname;
+          if (typeof n === 'string' && n) return n;
+          if (n && typeof n === 'object') return n['th-TH'] || n['en-US'] || Object.values(n).find(v => typeof v === 'string') || '';
+          return (typeof x.displayname === 'string' && x.displayname) || (typeof x.name === 'string' && x.name) || x.bankaccountname || x.thirdpartypaymentbankname || '';
+        };
+        banks = (Array.isArray(b) ? b : []).filter(x => x && x.isenabled !== false).map(x => ({ code: x.thirdpartypaymentbankcode, name: bname(x) || x.thirdpartypaymentbankcode }));
       } catch (e) { /* ประเภทที่อ่านแบงก์ไม่ได้ ปล่อยว่าง */ }
       types.push({ code, banks });
     }
