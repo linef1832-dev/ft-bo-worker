@@ -379,6 +379,24 @@ const K36 = {
     return { ok: true, playerid: fields.playerid, amount: amt, orderno: fields.thirdPartyRemoteOrderNo, result: d || null };
   },
 
+  // ดึงข้อมูลสำหรับ 3 dropdown ของฟอร์มฝาก: ประเภทที่เปิด + แบงก์ของแต่ละประเภท
+  async depositForm(site, token, channelId) {
+    if (!channelId) throw new Error('ไม่ได้ระบุช่องทาง/บัญชี');
+    const ch = await this.getChannel(site, token, channelId);
+    const tset = (ch.values && ch.values.types) || {};
+    const codes = Object.keys(tset).filter(c => tset[c].enabled);
+    const types = [];
+    for (const code of codes) {
+      let banks = [];
+      try {
+        const b = await boApi(site, token, 'GET', `/thirdpartypaymentbanks?thirdpartypaymentid=${encodeURIComponent(channelId)}&depositPaymentTypeEnum=${encodeURIComponent(code)}&currency=THB`);
+        banks = (Array.isArray(b) ? b : []).filter(x => x && x.isenabled !== false).map(x => ({ code: x.thirdpartypaymentbankcode, name: x.bankname || x.thirdpartypaymentbankcode }));
+      } catch (e) { /* ประเภทที่อ่านแบงก์ไม่ได้ ปล่อยว่าง */ }
+      types.push({ code, banks });
+    }
+    return { channelid: ch.id, channelcode: ch.code, name: ch.name, types };
+  },
+
   // ดึงรายชื่อช่องทางทั้งหมด
   async listChannels(site, token) {
     const rows = await boApi(site, token, 'GET', '/thirdpartypayments?currency=THB');
@@ -1067,6 +1085,10 @@ async function runTask(site, token, task) {
     if (!p.playerid) throw new Error('ไม่ได้ระบุรหัสสมาชิก');
     if (typeof P.playerInfo !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับการค้นยูส');
     return await P.playerInfo(site, token, String(p.playerid).trim());
+  }
+  if (a === 'deposit_form') {
+    if (typeof P.depositForm !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับ');
+    return await P.depositForm(site, token, p.channelid);
   }
   if (a === 'deposit_player') {
     if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนฝาก');
