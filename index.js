@@ -298,12 +298,17 @@ async function boApiForm(site, token, path, fields, _retried) {
 
 function _dstr(ms) { const d = new Date(ms), p = n => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); }
 
-// หาเลขออร์เดอร์หลังบ้าน (เช่น TF6N883OK28166...) จากผลลัพธ์ฝาก — ไล่หา string ที่มีรหัสช่อง + ตัวเลขยาว
+// หาเลขออร์เดอร์หลังบ้าน (เช่น TF6N883OK28166...) — เอาเฉพาะ "โทเคน" ที่มีรหัสช่อง+ตัวเลข ตัดส่วนอื่น (เช่น " / BT678") ทิ้ง
 function findOrderNo(obj, code) {
   let found = null;
+  const pick = str => {
+    const toks = String(str).split(/[\s\/|,;]+/);
+    for (const t of toks) { if (code && t.indexOf(code) >= 0 && /\d{6,}/.test(t)) return t; }
+    return null;
+  };
   const walk = o => {
     if (found || o == null) return;
-    if (typeof o === 'string') { if (code && o.indexOf(code) >= 0 && /\d{6,}/.test(o)) found = o; return; }
+    if (typeof o === 'string') { const t = pick(o); if (t) found = t; return; }
     if (typeof o === 'object') { for (const k in o) { if (found) break; walk(o[k]); } }
   };
   walk(obj); return found;
