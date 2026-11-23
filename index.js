@@ -312,15 +312,15 @@ async function writeSheet(p, dep) {
   const url = process.env.SHEET_WEBHOOK_URL, secret = process.env.SHEET_WEBHOOK_SECRET || '';
   if (!url || !p.sheet) return null;
   const s = p.sheet;
-  const payload = {
-    secret, web: s.web, date: s.date,
-    values: {
-      account: s.account || '', orderBO: dep.orderBO || '', user: p.playerid,
-      sheetAmt: (s.sheetAmt == null ? '' : s.sheetAmt), amount: dep.amount,
-      staff: s.staff || '', noteBD: p.orderno || ''
-    }
-  };
-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(15000), redirect: 'follow' });
+  // ส่งเป็น query param (Apps Script อ่านจาก e.parameter ได้ชัวร์ — ไม่โดนตัดตอน redirect เหมือน body)
+  const qs = new URLSearchParams({
+    secret, web: s.web || '', date: s.date || '',
+    account: s.account || '', orderBO: dep.orderBO || '', user: p.playerid || '',
+    sheetAmt: (s.sheetAmt == null ? '' : String(s.sheetAmt)), amount: String(dep.amount || 0),
+    staff: s.staff || '', noteBD: p.orderno || ''
+  }).toString();
+  const full = url + (url.indexOf('?') >= 0 ? '&' : '?') + qs;
+  const res = await fetch(full, { method: 'GET', signal: AbortSignal.timeout(15000), redirect: 'follow' });
   const txt = await res.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
   return j || { ok: res.ok, raw: (txt || '').slice(0, 160) };
 }
