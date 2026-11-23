@@ -296,6 +296,8 @@ async function boApiForm(site, token, path, fields, _retried) {
   return data;
 }
 
+function _dstr(ms) { const d = new Date(ms), p = n => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); }
+
 // หาเลขออร์เดอร์หลังบ้าน (เช่น TF6N883OK28166...) จากผลลัพธ์ฝาก — ไล่หา string ที่มีรหัสช่อง + ตัวเลขยาว
 function findOrderNo(obj, code) {
   let found = null;
@@ -409,6 +411,23 @@ const K36 = {
     };
     const d = await boApiForm(site, token, '/deposits/thirdParty', fields);
     return { ok: true, playerid: fields.playerid, amount: amt, orderno: fields.thirdPartyRemoteOrderNo, orderBO: findOrderNo(d, p.channelcode) || '', result: d || null };
+  },
+
+  // ดึงเลขออร์เดอร์หลังบ้าน (TF6N883OK...) จากรายการเงินฝากล่าสุดของยูส (หลัง deposit)
+  async fetchOrderBO(site, token, playerid, channelcode, bdOrder) {
+    const now = Date.now();
+    const body = {
+      exactMatch: true, zoneType: 'ASIA_HO_CHI_MINH', dateTo: _dstr(now), dateFrom: _dstr(now - 86400000),
+      timeFilter: 'deposittime', sortColumn: 'deposittime', sort: 'DESC', limit: 50, offset: 0,
+      statusType: 'DEPOSIT_RECORD', language: 5, playerId: playerid, startTime: now - 2 * 86400000, endTime: now + 3600000
+    };
+    const res = await boApi(site, token, 'POST', '/deposits/search', body);
+    let rows = Array.isArray(res) ? res : (res && (res.data || res.records || res.list || res.content || res.rows)) || [];
+    if (!Array.isArray(rows)) rows = [];
+    let rec = null;
+    if (bdOrder) rec = rows.find(r => { try { return JSON.stringify(r).indexOf(bdOrder) >= 0; } catch (e) { return false; } });
+    if (!rec) rec = rows[0];
+    return rec ? (findOrderNo(rec, channelcode) || '') : '';
   },
 
   // ดึงข้อมูลสำหรับ 3 dropdown ของฟอร์มฝาก: ประเภทที่เปิด + แบงก์ของแต่ละประเภท
@@ -1132,7 +1151,17 @@ async function runTask(site, token, task) {
     if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนฝาก');
     if (typeof P.deposit !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับการฝากเข้ายูส');
     const dep = await P.deposit(site, token, p);
-    try { const sr = await writeSheet(p, dep); if (sr) dep.sheet = sr; } catch (e) { dep.sheet = { ok: false, error: e.message || String(e) }; }
+    // ดึงเลขออร์เดอร์หลังบ้าน + เขียนชีต "เบื้องหลัง" (ไม่รอ) → ตอบกลับไว ไม่หน่วง
+    if (p.sheet && process.env.SHEET_WEBHOOK_URL) {
+      (async () => {
+        try {
+          if (!dep.orderBO && typeof P.fetchOrderBO === 'function') {
+            dep.orderBO = await P.fetchOrderBO(site, token, p.playerid, p.channelcode, p.orderno).catch(() => '');
+          }
+          await writeSheet(p, dep);
+        } catch (e) { log('⚠️ เขียนชีตเบื้องหลังพลาด', site.id, e.message || e); }
+      })();
+    }
     return dep;
   }
   if (a === 'ping') return { ok: true, name: site.name };
