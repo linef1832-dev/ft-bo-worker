@@ -323,8 +323,9 @@ async function writeSheet(p, dep) {
   const full = url + (url.indexOf('?') >= 0 ? '&' : '?') + qs;
   const res = await fetch(full, { method: 'GET', signal: AbortSignal.timeout(15000), redirect: 'follow' });
   const txt = await res.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
-  log('🧾 sheet', s.web, s.date, '→ HTTP', res.status, '·', (txt || '').slice(0, 160).replace(/\s+/g, ' '));
-  return j || { ok: res.ok, raw: (txt || '').slice(0, 160) };
+  log('🧾 sheet', s.web, s.date, '→ HTTP', res.status, '·', (txt || '').slice(0, 120).replace(/\s+/g, ' '));
+  if (!j) return { ok: false, error: 'webhook ไม่ตอบ JSON (ตั้ง Deploy เป็น "ทุกคน/Anyone" หรือยัง / ให้สิทธิ์ครบไหม)' };
+  return j;
 }
 
 // ========================================================
