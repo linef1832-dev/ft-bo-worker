@@ -132,6 +132,7 @@ function boHeaders(site, token) {
     'User-Agent': UA
   };
   if (token) h.Authorization = token; // หลังบ้านนี้ส่ง token ตรง ๆ ไม่มีคำว่า Bearer
+  h['x-currency'] = 'THB';   // บางปลายทาง (เช่น widdepinfo ของหน้าปรับยอด) ต้องมี header นี้
   return h;
 }
 
@@ -306,6 +307,28 @@ async function getRawChannel(site, token, channelId) {
 }
 
 const K36 = {
+  // ดึงข้อมูลยูส (สำหรับหน้าปรับยอด) — read-only
+  async playerInfo(site, token, playerid) {
+    const d = await boApi(site, token, 'GET', `/players/${encodeURIComponent(playerid)}/widdepinfo?accounttype=1&language=5`);
+    if (!d || !d.playerid) throw new Error('ไม่พบรหัสสมาชิกนี้');
+    const pick = m => Number((m && (m.THB != null ? m.THB : 0)) || 0);
+    return {
+      playerid: d.playerid,
+      name: d.firstname || '',
+      mobile: d.mobile || '',
+      currency: d.currency || 'THB',
+      available: Number(d.availablebalance || 0),
+      total: Number(d.totalbalance || 0),
+      pending: Number(d.pendingbalance || 0),
+      minDeposit: pick(d.minDepositAmtMap),
+      maxDeposit: pick(d.maxDepositAmtMap),
+      avgDeposit: Number(d.playeravgdepositamt || 0),
+      lastDeposit: d.lastdeposittime || null,
+      lastWithdraw: d.lastwithdrawtime || null,
+      banks: Array.isArray(d.playerbankinfo) ? d.playerbankinfo.map(b => ({ bankname: b.bankname || '', paymentid: b.paymentid || '' })) : []
+    };
+  },
+
   // ดึงรายชื่อช่องทางทั้งหมด
   async listChannels(site, token) {
     const rows = await boApi(site, token, 'GET', '/thirdpartypayments?currency=THB');
@@ -989,6 +1012,11 @@ async function runTask(site, token, task) {
     const r = await BANKS.set(site, token, p.banks, p.all, p.currency);
     if (p.batch_id) r.batch_id = p.batch_id;
     return r;
+  }
+  if (a === 'player_lookup') {
+    if (!p.playerid) throw new Error('ไม่ได้ระบุรหัสสมาชิก');
+    if (typeof P.playerInfo !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับการค้นยูส');
+    return await P.playerInfo(site, token, String(p.playerid).trim());
   }
   if (a === 'ping') return { ok: true, name: site.name };
   throw new Error('ไม่รู้จักคำสั่ง: ' + a);
