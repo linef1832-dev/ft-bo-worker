@@ -327,11 +327,21 @@ async function writeSheet(p, dep) {
     sheetAmt: (s.sheetAmt == null ? '' : String(s.sheetAmt)), amount: String(dep.amount || 0),
     staff: s.staff || '', noteBD: p.orderno || ''
   }).toString();
-  const full = url + (url.indexOf('?') >= 0 ? '&' : '?') + qs;
-  const res = await fetch(full, { method: 'GET', headers: { 'User-Agent': UA, 'Accept': 'application/json, text/plain, */*' }, signal: AbortSignal.timeout(15000), redirect: 'follow' });
-  const txt = await res.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
-  log('🧾 sheet', s.web, s.date, '→ HTTP', res.status, '·', (txt || '').slice(0, 120).replace(/\s+/g, ' '));
-  if (!j) return { ok: false, error: 'webhook ไม่ตอบ JSON (ตั้ง Deploy เป็น "ทุกคน/Anyone" หรือยัง / ให้สิทธิ์ครบไหม)' };
+  const base = url + (url.indexOf('?') >= 0 ? '&' : '?') + qs;
+  // Apps Script คืนหน้า interstitial (HTML) แบบสุ่มเวลายิงจากเซิร์ฟเวอร์ → ลองซ้ำได้ถึง 4 ครั้ง
+  let j = null, lastStatus = 0, lastTxt = '';
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const full = base + '&_r=' + Date.now() + attempt;   // กัน cache
+      const res = await fetch(full, { method: 'GET', headers: { 'User-Agent': UA, 'Accept': 'application/json, text/plain, */*' }, signal: AbortSignal.timeout(15000), redirect: 'follow' });
+      lastStatus = res.status; lastTxt = await res.text();
+      try { j = JSON.parse(lastTxt); } catch (e) { j = null; }
+    } catch (e) { lastTxt = 'fetch error: ' + (e.message || e); j = null; }
+    if (j) { if (attempt > 1) log('🧾 sheet', s.web, 'สำเร็จหลังลองซ้ำครั้งที่', attempt); break; }
+    if (attempt < 4) await _sleep(700 * attempt);   // รอแล้วลองใหม่
+  }
+  log('🧾 sheet', s.web, s.date, '→ HTTP', lastStatus, '·', (lastTxt || '').slice(0, 120).replace(/\s+/g, ' '));
+  if (!j) return { ok: false, error: 'webhook ไม่ตอบ JSON หลังลองซ้ำ 4 ครั้ง (Apps Script เด้งหน้า login ชั่วคราว — ลองฝากใหม่อีกครั้ง)' };
   return j;
 }
 
