@@ -942,6 +942,26 @@ const TCG = {
       lastDeposit: null, lastWithdraw: null, banks: []
     };
   },
+  // บัญชีธนาคารรับฝากของ TCG (ชื่อช่องในหน้าสร้างฝาก: KBANK/BBL) — คนละชุดกับช่องทางบุคคลที่สาม (88OKPay)
+  async depositAccounts(site, token, username) {
+    const merchant = tcgMerchant(site);
+    let customerId = '';
+    if (username) {
+      try {
+        const u = await tcgMcsApi(site, token, 'GET',
+          '/deposit/findUserForDepositRequest?merchantCode=' + encodeURIComponent(merchant) + '&username=' + encodeURIComponent(String(username).trim()));
+        customerId = (u && u.value && u.value.customerId) || '';
+      } catch (e) {}
+    }
+    const d = await tcgMcsApi(site, token, 'GET',
+      '/loadDepositBankAccountsByDepositType?merchantCode=' + encodeURIComponent(merchant) + '&depositType=&customerId=' + encodeURIComponent(customerId));
+    const arr = (d && d.value) || [];
+    return arr.map(a => {
+      const b = a.bank || {};
+      const acct = a.acctCode || b.bankCode || String(a.bankAccountId);
+      return { id: String(a.bankAccountId), code: acct, name: acct, staticname: b.bankEnName || b.bankChName || acct };
+    });
+  },
   // ค้นรายการฝากของยูสวันนี้ (status: ''=ทั้งหมด, 'N'=ใหม่, 'P'=รอ approve) · endpoint ต่างกันตาม pending
   async _searchDeposits(site, token, username, status, pending) {
     const today = tcgDateStr(Date.now()).slice(0, 10);
@@ -982,10 +1002,22 @@ const TCG = {
     const amt = Number(p.amount);
     if (!p.playerid) throw new Error('ไม่ได้ระบุรหัสสมาชิก');
     if (!(amt > 0)) throw new Error('จำนวนเงินไม่ถูกต้อง');
-    const bankAcctId = p.channelid || p.bankAcctId;
-    if (!bankAcctId) throw new Error('ไม่ได้เลือกบัญชีธนาคารฝาก');
     const merchant = tcgMerchant(site);
     const username = String(p.playerid).trim();
+
+    // บัญชีธนาคารรับฝาก: ถ้าหน้าเว็บไม่ได้เลือก → บอทเลือก BBL ให้เอง (เว็บไม่มี dropdown แล้ว)
+    let bankAcctId = p.channelid || p.bankAcctId, acctCode = '';
+    const accts = await this.depositAccounts(site, token, username).catch(() => []);
+    if (!bankAcctId) {
+      const bbl = accts.find(a => /\bBBL\b|BKKB|bangkok/i.test(a.code + ' ' + a.staticname)) || accts[0];
+      if (!bbl) throw new Error('ไม่พบบัญชีธนาคารรับฝากของเว็บนี้ (เช็กที่หลังบ้านว่ามีบัญชี BBL เปิดอยู่ไหม)');
+      bankAcctId = bbl.id; acctCode = bbl.code;
+    } else {
+      const m = accts.find(a => String(a.id) === String(bankAcctId));
+      acctCode = m ? m.code : '';
+    }
+    // ชื่อลงชีต (ช่อง A): ถ้าหน้าเว็บไม่ได้ส่งมา ใช้ชื่อบัญชีที่บอทเลือก (เช่น BBL)
+    if (p.sheet && !p.sheet.account && acctCode) p.sheet.account = acctCode;
 
     // 1) สร้างคำขอฝาก (ไม่คืน depositId มาให้)
     await tcgApi(site, token, 'POST', '/relay/post/mcs-internal-v3-player-deposit-createDeposit', {
