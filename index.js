@@ -797,9 +797,9 @@ function tcgHeaders(site, token, extra) {
   if (extra && extra.merchant) { h.merchant = extra.merchant; h.merchantcode = extra.merchant; h.notpending = 'true'; }
   return h;
 }
-// ยิง API แบบดิบ คืน { status, body }
-async function tcgFetch(site, method, path, body, token, extra) {
-  const res = await fetch(site.api_base + path, {
+// ยิง API แบบดิบ คืน { status, body }  —  base เว้นว่าง = /tac/api (ค่าปริยาย) · ส่ง base มาเพื่อยิง /mcs_console/api
+async function tcgFetch(site, method, path, body, token, extra, base) {
+  const res = await fetch((base || site.api_base) + path, {
     method, headers: tcgHeaders(site, token, extra),
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(HTTP_TIMEOUT_MS), ...boFetchOpts()
@@ -863,6 +863,27 @@ async function tcgApi(site, token, method, path, body, _retried) {
 }
 const tcgMerchant = site => ((sessions.get(site.id) || {}).extra || {}).merchant || '';
 
+// ----- เรียก API ฝั่ง /mcs_console/api (คนละ base กับ /tac/api แต่ host เดียวกัน · ใช้ header/ token เดียวกัน) -----
+function tcgMcsBase(site) { return new URL(site.web_url).origin + '/mcs_console/api'; }
+async function tcgMcsApi(site, token, method, path, body, _retried) {
+  const sess = sessions.get(site.id) || {};
+  const r = await tcgFetch(site, method, path, body, token, sess.extra, tcgMcsBase(site));
+  const d = r.data;
+  const authFail = r.status === 401 || r.status === 403 || (d && d.success === false && TCG_AUTH_ERR.test(String(d.errorCode || '') + ' ' + String(d.message || '')));
+  if (authFail && !_retried) {
+    sessions.delete(site.id);
+    try { const fresh = await ensureToken(site); return await tcgMcsApi(site, fresh, method, path, body, true); } catch (e2) {}
+  }
+  if (r.status >= 400 || !d || d.success === false) {
+    log('🔻 tcgMcsApi', site.id, method, path.split('?')[0], '→', r.status, (d && (d.message || d.errorCode)) || (r.text || '').slice(0, 160).replace(/\s+/g, ' '));
+    const e = new Error((d && (d.message || d.errorCode)) || ('HTTP ' + r.status)); e.httpStatus = r.status; throw e;
+  }
+  return d;   // คืนทั้งห่อ { success, value, ... }
+}
+const _sleep = ms => new Promise(r => setTimeout(r, ms));
+// 'YYYY-MM-DD HH:mm:ss' ตามเวลา UTC+8 (เหมือนหน้าเว็บ TCG) โดยไม่ขึ้นกับ timezone ของ VPS
+function tcgDateStr(ms) { return new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' '); }
+
 // ----- ช่องทางชำระเงิน (บัญชีบุคคลที่สาม) -----
 // แปลงเป็นรูปแบบเดียวกับ K36 ให้หน้า FT ใช้ร่วมกันได้:
 //   status (สถานะช่อง): accountStatus A→1 (เปิด)  I→4 (ปิดการใช้งาน)
@@ -905,6 +926,101 @@ const TCG = {
     for (const x of a.concat(i)) if (x && x.bankAccountId != null && !seen.has(x.bankAccountId)) seen.set(x.bankAccountId, x);
     return [...seen.values()].map(x => ({ id: String(x.bankAccountId), code: x.displayAccountNumber || x.channelName, name: x.channelName, staticname: x.bankName || '' }));
   },
+  // ====== ปรับยอดเข้ายูส (ฝากมือ) ======
+  // ดึงข้อมูลยูส (ยืนยันว่ามีจริง + ระดับ VIP) — TCG ไม่มี balance ให้ตรงๆ
+  async playerInfo(site, token, playerid) {
+    const u = String(playerid).trim();
+    const d = await tcgMcsApi(site, token, 'GET',
+      '/deposit/findUserForDepositRequest?merchantCode=' + encodeURIComponent(tcgMerchant(site)) + '&username=' + encodeURIComponent(u));
+    const v = d && d.value;
+    if (!v || v.customerId == null) throw new Error('ไม่พบรหัสสมาชิกนี้');
+    const vip = (v.clubLabels && v.clubLabels[0] && v.clubLabels[0].labelName) || '';
+    return {
+      playerid: u, name: vip ? ('ระดับ ' + vip) : '', mobile: '', currency: 'THB',
+      customerId: v.customerId, vip,
+      available: null, total: null, pending: null, minDeposit: null, maxDeposit: null, avgDeposit: null,
+      lastDeposit: null, lastWithdraw: null, banks: []
+    };
+  },
+  // ค้นรายการฝากของยูสวันนี้ (status: ''=ทั้งหมด, 'N'=ใหม่, 'P'=รอ approve) · endpoint ต่างกันตาม pending
+  async _searchDeposits(site, token, username, status, pending) {
+    const today = tcgDateStr(Date.now()).slice(0, 10);
+    const q = new URLSearchParams({
+      username, depositId: '', bankRef: '', depositStatus: status || '', amountFromStr: '', amountToStr: '',
+      depositType: '', bankAcctIdList: '', searchDateMode: 'requestTime',
+      dateFrom: today + ' 00:00:00', dateTo: today + ' 23:59:59', tcpBankCode: '',
+      merchantCode: tcgMerchant(site), pageNo: '1', pageSize: '20'
+    });
+    if (!pending) { q.set('sortBy', 'depositId'); q.set('sortOrder', 'DESC'); }
+    const path = pending ? '/relay/get/mcs-player-deposit-searchPending?' : '/relay/get/mcs-player-deposit-search?';
+    const v = await tcgApi(site, token, 'GET', path + q.toString());
+    return Array.isArray(v) ? v : (v && v.list) || [];
+  },
+  // หา depositId + version ของรายการที่เพิ่งสร้าง (สถานะ N ที่ยอด+บัญชีตรง เอาเลขล่าสุด)
+  async _findNewDeposit(site, token, username, amt, bankAcctId) {
+    for (let i = 0; i < 10; i++) {
+      const rows = await this._searchDeposits(site, token, username, 'N', false).catch(() => []);
+      const cand = rows.filter(r => String(r.bankAcctId) === String(bankAcctId) && Number(r.requestAmount) === Number(amt) && r.depositStatus === 'N');
+      cand.sort((a, b) => String(b.depositId).localeCompare(String(a.depositId), undefined, { numeric: true }));
+      if (cand.length) return { depositId: String(cand[0].depositId), version: cand[0].version };
+      await _sleep(450);
+    }
+    return null;
+  },
+  // รอให้รายการขึ้นสถานะ P แล้วคืน version ใหม่ + wfTaskId
+  async _findPending(site, token, username, depositId) {
+    for (let i = 0; i < 10; i++) {
+      const rows = await this._searchDeposits(site, token, username, 'P', true).catch(() => []);
+      const m = rows.find(r => String(r.depositId) === String(depositId));
+      if (m) return m;
+      await _sleep(450);
+    }
+    return null;
+  },
+  // ฝากมือเข้ายูส (3 สเต็ป: createDeposit → ส่งตรวจสอบ(process) → ฝากสำเร็จ(approve))
+  async deposit(site, token, p) {
+    const amt = Number(p.amount);
+    if (!p.playerid) throw new Error('ไม่ได้ระบุรหัสสมาชิก');
+    if (!(amt > 0)) throw new Error('จำนวนเงินไม่ถูกต้อง');
+    const bankAcctId = p.channelid || p.bankAcctId;
+    if (!bankAcctId) throw new Error('ไม่ได้เลือกบัญชีธนาคารฝาก');
+    const merchant = tcgMerchant(site);
+    const username = String(p.playerid).trim();
+
+    // 1) สร้างคำขอฝาก (ไม่คืน depositId มาให้)
+    await tcgApi(site, token, 'POST', '/relay/post/mcs-internal-v3-player-deposit-createDeposit', {
+      merchantCode: merchant, username, depositType: 1, bankAcctId: Number(bankAcctId),
+      requestDateString: tcgDateStr(Date.now()), requestAmount: amt, customerBankCharge: 0, bankCharge: ''
+    });
+
+    // 2) หาเลขรายการที่เพิ่งสร้าง (สถานะ N) + version
+    const rec = await this._findNewDeposit(site, token, username, amt, bankAcctId);
+    if (!rec) throw new Error('สร้างคำขอฝากแล้ว แต่หาเลขรายการไม่เจอ — เช็กที่หลังบ้านว่ารายการค้างอยู่ไหม');
+    const depositId = rec.depositId;
+
+    // 3) ส่งเพื่อตรวจสอบ (process)
+    const body = {
+      depositId, tpRefNo: null, payerBankAcctName: null, payerBankAcctNum: null,
+      depositAmount: amt, bankRef: null, operatorRemark: null, internalRemark: null,
+      version: rec.version, merchantCode: merchant
+    };
+    await tcgMcsApi(site, token, 'POST', '/deposit/process', Object.assign({}, body, { isProcessAndApprove: false }));
+
+    // 4) รอสถานะ P → version ใหม่ + wfTaskId
+    const pend = await this._findPending(site, token, username, depositId);
+    if (!pend) throw new Error('ส่งตรวจสอบแล้ว แต่รายการยังไม่ขึ้นสถานะพร้อม approve (ลองกดฝากสำเร็จที่หลังบ้าน)');
+
+    // 5) lock task (หน้าเว็บทำก่อนกดฝากสำเร็จ)
+    if (pend.wfTaskId) {
+      try { await tcgMcsApi(site, token, 'GET', '/task/lock?taskId=' + encodeURIComponent(pend.wfTaskId) + '&moduleType=' + encodeURIComponent('Process and Approve Deposit')); } catch (e) {}
+    }
+
+    // 6) ฝากเงินสำเร็จ (approve) — ยอดเข้ายูสจริง
+    await tcgApi(site, token, 'POST', '/relay/post/mcs-v3-deposit-approve', Object.assign({}, body, { version: pend.version }));
+
+    return { ok: true, playerid: username, amount: amt, orderno: depositId, orderBO: depositId, result: null };
+  },
+
   async getRaw(site, token, channelId) {
     const q = new URLSearchParams({ bankAccountId: String(channelId), merchantCode: tcgMerchant(site) });
     const raw = await tcgApi(site, token, 'GET', '/relay/get/mcs-bankaccount-thirdparty-get?' + q);
