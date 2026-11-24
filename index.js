@@ -1005,19 +1005,12 @@ const TCG = {
     const merchant = tcgMerchant(site);
     const username = String(p.playerid).trim();
 
-    // บัญชีธนาคารรับฝาก: ถ้าหน้าเว็บไม่ได้เลือก → บอทเลือก BBL ให้เอง (เว็บไม่มี dropdown แล้ว)
-    let bankAcctId = p.channelid || p.bankAcctId, acctCode = '';
+    // หลังบ้าน TCG ฝากเข้าบัญชี BBL เสมอ (ช่องที่เลือกในเว็บเป็นแค่ "ชื่อลงชีต" ไม่เกี่ยวกับหลังบ้าน)
     const accts = await this.depositAccounts(site, token, username).catch(() => []);
-    if (!bankAcctId) {
-      const bbl = accts.find(a => /\bBBL\b|BKKB|bangkok/i.test(a.code + ' ' + a.staticname)) || accts[0];
-      if (!bbl) throw new Error('ไม่พบบัญชีธนาคารรับฝากของเว็บนี้ (เช็กที่หลังบ้านว่ามีบัญชี BBL เปิดอยู่ไหม)');
-      bankAcctId = bbl.id; acctCode = bbl.code;
-    } else {
-      const m = accts.find(a => String(a.id) === String(bankAcctId));
-      acctCode = m ? m.code : '';
-    }
-    // ชื่อลงชีต (ช่อง A): ถ้าหน้าเว็บไม่ได้ส่งมา ใช้ชื่อบัญชีที่บอทเลือก (เช่น BBL)
-    if (p.sheet && !p.sheet.account && acctCode) p.sheet.account = acctCode;
+    const bbl = accts.find(a => /\bBBL\b|BKKB|bangkok/i.test(a.code + ' ' + a.staticname)) || accts[0];
+    if (!bbl) throw new Error('ไม่พบบัญชีธนาคารรับฝาก BBL ของเว็บนี้ (เช็กที่หลังบ้านว่ามีบัญชี BBL เปิดอยู่ไหม)');
+    const bankAcctId = bbl.id;
+    if (p.sheet && !p.sheet.account) p.sheet.account = bbl.code;   // ถ้าเว็บไม่ได้ส่งชื่อลงชีต ใช้ชื่อบัญชี BBL
 
     // 1) สร้างคำขอฝาก (ไม่คืน depositId มาให้)
     await tcgApi(site, token, 'POST', '/relay/post/mcs-internal-v3-player-deposit-createDeposit', {
