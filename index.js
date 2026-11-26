@@ -424,7 +424,21 @@ const K36 = {
       status: 2,                 // ฝากเข้าตรง (ข้ามขั้นตอนตรวจสอบ)
       requesttime: Date.now()
     };
-    const d = await boApiForm(site, token, '/deposits/thirdParty', fields);
+    let d;
+    try {
+      d = await boApiForm(site, token, '/deposits/thirdParty', fields);
+    } catch (e) {
+      // พิมพ์ตัวเล็ก/ใหญ่ไม่ตรงกับที่หลังบ้านเก็บ → หา player ไม่เจอ: ค้นชื่อจริง (หลังบ้านค้นแบบไม่สนเคส) แล้วฝากใหม่ครั้งเดียว
+      if (/player\s*not\s*found|user\s*not\s*found|ไม่พบ(รหัส|ผู้เล่น|ยูส)/i.test(e.message || '')) {
+        let real = '';
+        try { const info = await this.playerInfo(site, token, fields.playerid); real = info && info.playerid ? String(info.playerid).trim() : ''; } catch (_) {}
+        if (real && real !== fields.playerid) {
+          log('🔤 แก้ตัวพิมพ์ยูส', site.id, fields.playerid, '→', real, '(ฝากใหม่อัตโนมัติ)');
+          fields.playerid = real;
+          d = await boApiForm(site, token, '/deposits/thirdParty', fields);
+        } else { throw e; }
+      } else { throw e; }
+    }
     return { ok: true, playerid: fields.playerid, amount: amt, orderno: fields.thirdPartyRemoteOrderNo, orderBO: findOrderNo(d, p.channelcode) || '', result: d || null };
   },
 
