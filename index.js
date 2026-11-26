@@ -382,7 +382,16 @@ async function getRawChannel(site, token, channelId) {
 const K36 = {
   // ดึงข้อมูลยูส (สำหรับหน้าปรับยอด) — read-only
   async playerInfo(site, token, playerid) {
-    const d = await boApi(site, token, 'GET', `/players/${encodeURIComponent(playerid)}/widdepinfo?accounttype=1&language=5`);
+    // หลังบ้าน widdepinfo ค้นแบบตรงเป๊ะ (สนตัวเล็ก/ใหญ่) — ลองหลายรูปแบบ: ตามพิมพ์ → ตัวเล็กหมด → ตัวใหญ่หมด
+    const typed = String(playerid).trim();
+    const variants = [...new Set([typed, typed.toLowerCase(), typed.toUpperCase()])];
+    let d = null;
+    for (const v of variants) {
+      try {
+        const r = await boApi(site, token, 'GET', `/players/${encodeURIComponent(v)}/widdepinfo?accounttype=1&language=5`);
+        if (r && r.playerid) { d = r; break; }
+      } catch (_) { /* รูปแบบนี้ไม่เจอ ลองตัวถัดไป */ }
+    }
     if (!d || !d.playerid) throw new Error('ไม่พบรหัสสมาชิกนี้');
     const pick = m => Number((m && (m.THB != null ? m.THB : 0)) || 0);
     return {
@@ -970,10 +979,17 @@ const TCG = {
   // ====== ปรับยอดเข้ายูส (ฝากมือ) ======
   // ดึงข้อมูลยูส (ยืนยันว่ามีจริง + ระดับ VIP) — TCG ไม่มี balance ให้ตรงๆ
   async playerInfo(site, token, playerid) {
-    const u = String(playerid).trim();
-    const d = await tcgMcsApi(site, token, 'GET',
-      '/deposit/findUserForDepositRequest?merchantCode=' + encodeURIComponent(tcgMerchant(site)) + '&username=' + encodeURIComponent(u));
-    const v = d && d.value;
+    const typed = String(playerid).trim();
+    // ลองหลายรูปแบบตัวพิมพ์ (ตามพิมพ์ → เล็กหมด → ใหญ่หมด) เผื่อหลังบ้านสนตัวเล็ก/ใหญ่
+    const variants = [...new Set([typed, typed.toLowerCase(), typed.toUpperCase()])];
+    let u = typed, v = null;
+    for (const cand of variants) {
+      try {
+        const d = await tcgMcsApi(site, token, 'GET',
+          '/deposit/findUserForDepositRequest?merchantCode=' + encodeURIComponent(tcgMerchant(site)) + '&username=' + encodeURIComponent(cand));
+        if (d && d.value && d.value.customerId != null) { v = d.value; u = cand; break; }
+      } catch (_) { /* รูปแบบนี้ไม่เจอ ลองตัวถัดไป */ }
+    }
     if (!v || v.customerId == null) throw new Error('ไม่พบรหัสสมาชิกนี้');
     const vip = (v.clubLabels && v.clubLabels[0] && v.clubLabels[0].labelName) || '';
     return {
