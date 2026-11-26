@@ -445,6 +445,23 @@ const K36 = {
     return rec ? (findOrderNo(rec, channelcode) || '') : '';
   },
 
+  // ตรวจว่า BD ออร์เดอร์นี้ "เข้าหลังบ้านจริงหรือยัง" — ใช้กู้สถานะตอน HTTP timeout (เข้าแล้วแต่ตอบไม่ทัน)
+  // คืน record ถ้าเจอ (ฝากเข้าแล้ว) / null ถ้ายังไม่พบ (ยังไม่เข้า)
+  async findDeposit(site, token, playerid, bdOrder) {
+    if (!bdOrder) return null;
+    const now = Date.now();
+    const body = {
+      exactMatch: true, zoneType: 'ASIA_HO_CHI_MINH', dateTo: _dstr(now), dateFrom: _dstr(now - 86400000),
+      timeFilter: 'deposittime', sortColumn: 'deposittime', sort: 'DESC', limit: 50, offset: 0,
+      statusType: 'DEPOSIT_RECORD', language: 5, playerId: playerid, startTime: now - 2 * 86400000, endTime: now + 3600000
+    };
+    const res = await boApi(site, token, 'POST', '/deposits/search', body);
+    let rows = Array.isArray(res) ? res : (res && (res.data || res.records || res.list || res.content || res.rows)) || [];
+    if (!Array.isArray(rows)) rows = [];
+    const bd = String(bdOrder).trim();
+    return rows.find(r => { try { return JSON.stringify(r).indexOf(bd) >= 0; } catch (e) { return false; } }) || null;
+  },
+
   // ดึงข้อมูลสำหรับ 3 dropdown ของฟอร์มฝาก: ประเภทที่เปิด + แบงก์ของแต่ละประเภท
   async depositForm(site, token, channelId) {
     if (!channelId) throw new Error('ไม่ได้ระบุช่องทาง/บัญชี');
@@ -1236,11 +1253,13 @@ function platformOf(site) { return PLATFORMS[site.platform] || PLATFORMS.default
 
 // ---------- จัดการคิวงาน bo_tasks ----------
 async function claimTask(task) {
-  // จองงาน: เปลี่ยน queued→running เฉพาะถ้ายัง queued (กันสองรอบทำซ้ำ)
+  // จองงานแบบอะตอมมิก: เปลี่ยน queued→running เฉพาะถ้ายัง queued แล้ว "ตรวจว่าจองได้จริง"
+  // ถ้าอีกโปรเซส/อีกลูปจองไปก่อน PATCH จะไม่โดนแถวใด (คืน []) → คืน false เพื่อข้าม ห้ามทำซ้ำ (กันเงินเข้าซ้ำ)
   const rows = await sb('PATCH',
     `bo_tasks?id=eq.${task.id}&status=eq.queued`,
-    { status: 'running', started_at: new Date().toISOString() });
-  return true; // Prefer:minimal ไม่คืน rows; เราใช้ if_version ด้วย confirmed อยู่แล้ว
+    { status: 'running', started_at: new Date().toISOString() },
+    'return=representation');
+  return Array.isArray(rows) && rows.length > 0;
 }
 
 async function runTask(site, token, task) {
@@ -1306,7 +1325,26 @@ async function runTask(site, token, task) {
   if (a === 'deposit_player') {
     if (!task.confirmed) throw new Error('ต้องกดยืนยันก่อนฝาก');
     if (typeof P.deposit !== 'function') throw new Error('แพลตฟอร์มนี้ยังไม่รองรับการฝากเข้ายูส');
-    const dep = await P.deposit(site, token, p);
+    let dep;
+    try {
+      dep = await P.deposit(site, token, p);
+    } catch (e) {
+      // กัน "ขึ้นพลาด แต่จริงๆ เข้าแล้ว" (หลังบ้านตอบช้า/เน็ตหลุด หลัง 20 วิ) → อย่าเพิ่งบอกพลาด ไปเช็คหลังบ้านก่อน
+      const looksTimeout = e.name === 'TimeoutError' || e.name === 'AbortError'
+        || /timeout|aborted|network|fetch failed|socket|ECONN|ETIMEDOUT|EAI_AGAIN/i.test(e.message || '');
+      if (looksTimeout && typeof P.findDeposit === 'function' && p.orderno) {
+        let rec = null;
+        try { const tk = await ensureToken(site); rec = await P.findDeposit(site, tk, p.playerid, p.orderno); } catch (_) {}
+        if (rec) {
+          log('🛟 กู้สถานะฝาก', site.id, p.playerid, p.orderno, '— เข้าแล้วจริง (หลัง timeout) ไม่ต้องเติมซ้ำ');
+          dep = { ok: true, recovered: true, playerid: String(p.playerid).trim(), amount: Number(p.amount),
+                  orderno: String(p.orderno).trim(), orderBO: findOrderNo(rec, p.channelcode) || '', result: rec };
+        } else {
+          const err = new Error('⚠️ ไม่แน่ใจว่าเข้าหรือยัง (หลังบ้านตอบช้า) — กรุณาตรวจที่หลังบ้านก่อนเติมซ้ำ');
+          err.uncertain = true; throw err;
+        }
+      } else { throw e; }
+    }
     // ดึงเลขออร์เดอร์หลังบ้าน + เขียนชีต "เบื้องหลัง" (ไม่รอ) → ตอบกลับไว ไม่หน่วง
     if (p.sheet && process.env.SHEET_WEBHOOK_URL) {
       (async () => {
@@ -1342,7 +1380,7 @@ async function processTasksLocked(site, token) {
         { status: 'expired', finished_at: new Date().toISOString(), error: 'หมดอายุก่อนทำ' });
       continue;
     }
-    await claimTask(task);
+    if (!(await claimTask(task))) continue;   // ถูกจองไปแล้วโดยตัวอื่น → ข้าม ห้ามทำซ้ำ (กันเงินเข้าซ้ำ)
     try {
       const tk = await ensureToken(site);   // token สดเสมอต่อ 1 งาน (หลังบ้านใช้ token ได้ทีละอัน)
       const result = await runTask(site, tk, task);
