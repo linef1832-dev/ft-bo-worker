@@ -381,10 +381,12 @@ let _warmTick = 0;
 async function sheetWarmLoop() {
   if (!process.env.SHEET_WEBHOOK_URL) return;
   const today = bangkokNow().date;
+  // วันนี้ + เมื่อวาน: อุ่นทุกรอบ (90 วิ) เพราะดูบ่อยสุด → เด้งทันทีเสมอ
   try { await readSheet(today); } catch (e) { log('⚠️ อุ่นชีตวันนี้', e.message || e); }
+  try { await readSheet(_dateMinus(today, 1)); } catch (e) {}
   _warmTick++;
-  if (_warmTick % 7 === 1) {                       // ~ทุก 10 นาที
-    for (let i = 1; i <= 7; i++) {
+  if (_warmTick % 7 === 1) {                       // ย้อนหลัง 2–7 วัน ทุกๆ ~10 นาที
+    for (let i = 2; i <= 7; i++) {
       try { await readSheet(_dateMinus(today, i)); } catch (e) {}
     }
   }
