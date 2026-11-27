@@ -374,10 +374,20 @@ async function readSheet(date) {
   putSetting('ft_sheetsum_' + key, { rows: j.rows || [], count: j.count || 0, at: Date.now() }).catch(() => {});
   return j;   // { ok, date, count, rows:[{web,source,staff,user,amount,orderBO,account}] }
 }
-// อุ่นแคชชีตของ "วันนี้" ไว้ล่วงหน้าเป็นระยะ → หน้า FT อ่านจาก Supabase เด้งทันที
+// อุ่นแคชชีตไว้ล่วงหน้า → หน้า FT อ่านจาก Supabase เด้งทันที
+// วันนี้: อุ่นทุกรอบ (90 วิ) · ย้อนหลัง 7 วัน: อุ่นทุกๆ ~10 นาที (วันเก่าไม่ค่อยเปลี่ยน)
+function _dateMinus(ds, n) { const d = new Date(ds + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - n); return d.toISOString().slice(0, 10); }
+let _warmTick = 0;
 async function sheetWarmLoop() {
   if (!process.env.SHEET_WEBHOOK_URL) return;
-  try { await readSheet(bangkokNow().date); } catch (e) { log('⚠️ อุ่นชีต', e.message || e); }
+  const today = bangkokNow().date;
+  try { await readSheet(today); } catch (e) { log('⚠️ อุ่นชีตวันนี้', e.message || e); }
+  _warmTick++;
+  if (_warmTick % 7 === 1) {                       // ~ทุก 10 นาที
+    for (let i = 1; i <= 7; i++) {
+      try { await readSheet(_dateMinus(today, i)); } catch (e) {}
+    }
+  }
 }
 
 // ========================================================
