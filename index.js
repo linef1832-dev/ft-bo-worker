@@ -370,7 +370,14 @@ async function readSheet(date) {
   if (!j) throw new Error('ชีตไม่ตอบ JSON (Apps Script อาจเด้ง login ชั่วคราว — ลองใหม่อีกครั้ง)');
   if (!j.ok) throw new Error(j.error || 'อ่านชีตไม่สำเร็จ');
   _sheetSumCache.set(key, { at: Date.now(), data: j });
+  // เก็บลง Supabase (settings) ให้หน้า FT อ่านได้ทันที ไม่ต้องรอ Google
+  putSetting('ft_sheetsum_' + key, { rows: j.rows || [], count: j.count || 0, at: Date.now() }).catch(() => {});
   return j;   // { ok, date, count, rows:[{web,source,staff,user,amount,orderBO,account}] }
+}
+// อุ่นแคชชีตของ "วันนี้" ไว้ล่วงหน้าเป็นระยะ → หน้า FT อ่านจาก Supabase เด้งทันที
+async function sheetWarmLoop() {
+  if (!process.env.SHEET_WEBHOOK_URL) return;
+  try { await readSheet(bangkokNow().date); } catch (e) { log('⚠️ อุ่นชีต', e.message || e); }
 }
 
 // ========================================================
@@ -1676,6 +1683,8 @@ setTimeout(syncLoop, 12 * 1000);   // ซิงค์ครั้งแรกห
 setInterval(syncLoop, SYNC_MS);
 setTimeout(scheduleLoop, 15 * 1000);   // รอให้ล็อกอินเสร็จก่อน
 setInterval(scheduleLoop, SCHED_POLL_MS);
+setTimeout(sheetWarmLoop, 25 * 1000);  // อุ่นแคชชีตวันนี้ครั้งแรก
+setInterval(sheetWarmLoop, 90 * 1000); // แล้วอุ่นทุก 90 วิ
 
 process.on('SIGTERM', () => { log('👋 ปิดบอท'); process.exit(0); });
 process.on('unhandledRejection', e => log('⚠️ unhandled:', e && e.message));
