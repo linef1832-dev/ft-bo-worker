@@ -345,6 +345,28 @@ async function writeSheet(p, dep) {
   return j;
 }
 
+// อ่านสรุปจากชีต: ให้วันที่ → Apps Script อ่านแท็บ "บุคคลที่3" + "ปรับด้วยมือ" ของทุกไฟล์วันนั้น → คืนแถวดิบ
+async function readSheet(date) {
+  const url = process.env.SHEET_WEBHOOK_URL, secret = process.env.SHEET_WEBHOOK_SECRET || '';
+  if (!url) throw new Error('ยังไม่ได้ตั้ง SHEET_WEBHOOK_URL ที่บอท');
+  const qs = new URLSearchParams({ secret, summary: '1', date: String(date || '') }).toString();
+  const base = url + (url.indexOf('?') >= 0 ? '&' : '?') + qs;
+  let j = null, lastTxt = '';
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch(base + '&_r=' + Date.now() + attempt, { method: 'GET', headers: { 'User-Agent': UA, 'Accept': 'application/json, text/plain, */*' }, signal: AbortSignal.timeout(60000), redirect: 'follow' });
+      lastTxt = await res.text();
+      try { j = JSON.parse(lastTxt); } catch (e) { j = null; }
+    } catch (e) { lastTxt = 'fetch error: ' + (e.message || e); j = null; }
+    if (j) break;
+    if (attempt < 4) await _sleep(800 * attempt);
+  }
+  log('🧾 sheet-summary', date, '→', (lastTxt || '').slice(0, 120).replace(/\s+/g, ' '));
+  if (!j) throw new Error('ชีตไม่ตอบ JSON (Apps Script อาจเด้ง login ชั่วคราว — ลองใหม่อีกครั้ง)');
+  if (!j.ok) throw new Error(j.error || 'อ่านชีตไม่สำเร็จ');
+  return j;   // { ok, date, count, rows:[{web,source,staff,user,amount,orderBO,account}] }
+}
+
 // ========================================================
 // ความสามารถของ "ระบบหลังบ้านแบบ K36 (tf6prod-ims)"
 // งานช่องทางชำระเงิน: list / get / save
@@ -1388,6 +1410,7 @@ async function runTask(site, token, task) {
     }
     return dep;
   }
+  if (a === 'sheet_summary') return await readSheet(p.date);
   if (a === 'ping') return { ok: true, name: site.name };
   throw new Error('ไม่รู้จักคำสั่ง: ' + a);
 }
