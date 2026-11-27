@@ -346,7 +346,12 @@ async function writeSheet(p, dep) {
 }
 
 // อ่านสรุปจากชีต: ให้วันที่ → Apps Script อ่านแท็บ "บุคคลที่3" + "ปรับด้วยมือ" ของทุกไฟล์วันนั้น → คืนแถวดิบ
+const _sheetSumCache = new Map();   // date -> { at, data }  (แคชสั้นๆ กันอ่าน Google ซ้ำถี่ๆ)
+const SHEET_SUM_TTL = 25000;
 async function readSheet(date) {
+  const key = String(date || '');
+  const cached = _sheetSumCache.get(key);
+  if (cached && Date.now() - cached.at < SHEET_SUM_TTL) return cached.data;
   const url = process.env.SHEET_WEBHOOK_URL, secret = process.env.SHEET_WEBHOOK_SECRET || '';
   if (!url) throw new Error('ยังไม่ได้ตั้ง SHEET_WEBHOOK_URL ที่บอท');
   const qs = new URLSearchParams({ secret, summary: '1', date: String(date || '') }).toString();
@@ -364,6 +369,7 @@ async function readSheet(date) {
   log('🧾 sheet-summary', date, '→', (lastTxt || '').slice(0, 120).replace(/\s+/g, ' '));
   if (!j) throw new Error('ชีตไม่ตอบ JSON (Apps Script อาจเด้ง login ชั่วคราว — ลองใหม่อีกครั้ง)');
   if (!j.ok) throw new Error(j.error || 'อ่านชีตไม่สำเร็จ');
+  _sheetSumCache.set(key, { at: Date.now(), data: j });
   return j;   // { ok, date, count, rows:[{web,source,staff,user,amount,orderBO,account}] }
 }
 
