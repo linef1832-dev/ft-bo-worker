@@ -348,6 +348,7 @@ async function writeSheet(p, dep) {
 // อ่านสรุปจากชีต: ให้วันที่ → Apps Script อ่านแท็บ "บุคคลที่3" + "ปรับด้วยมือ" ของทุกไฟล์วันนั้น → คืนแถวดิบ
 const _sheetSumCache = new Map();   // date -> { at, data }  (แคชสั้นๆ กันอ่าน Google ซ้ำถี่ๆ)
 const SHEET_SUM_TTL = 25000;
+const SHEET_CACHE_VER = 2;          // เวอร์ชันข้อมูลใน Supabase — เพิ่มเลขนี้เมื่อแก้วิธีอ่าน เพื่อบังคับอ่านใหม่ทับของเก่า
 async function readSheet(date) {
   const key = String(date || '');
   const cached = _sheetSumCache.get(key);
@@ -371,7 +372,7 @@ async function readSheet(date) {
   if (!j.ok) throw new Error(j.error || 'อ่านชีตไม่สำเร็จ');
   _sheetSumCache.set(key, { at: Date.now(), data: j });
   // เก็บลง Supabase (settings) ให้หน้า FT อ่านได้ทันที ไม่ต้องรอ Google
-  putSetting('ft_sheetsum_' + key, { rows: j.rows || [], count: j.count || 0, at: Date.now() }).catch(() => {});
+  putSetting('ft_sheetsum_' + key, { rows: j.rows || [], count: j.count || 0, at: Date.now(), v: SHEET_CACHE_VER }).catch(() => {});
   return j;   // { ok, date, count, rows:[{web,source,staff,user,amount,orderBO,account}] }
 }
 // อุ่นแคชชีตไว้ล่วงหน้าใน Supabase → หน้า FT อ่านเด้งทันที
@@ -391,7 +392,7 @@ async function sheetWarmLoop() {
       const i = 2 + ((_warmScan - 2 + k) % SHEET_BACKFILL_DAYS);
       const d = _dateMinus(today, i);
       let have = null; try { have = await getSetting('ft_sheetsum_' + d); } catch (e) {}
-      if (!have || !have.rows) {                  // ยังไม่มี → อ่านมาเก็บ แล้วหยุด (เหลือรอบหน้าค่อยเก็บวันถัดไป)
+      if (!have || !have.rows || have.v !== SHEET_CACHE_VER) {   // ยังไม่มี/เวอร์ชันเก่า → อ่านมาเก็บ แล้วหยุด (รอบหน้าค่อยเก็บวันถัดไป)
         try { await readSheet(d); log('🧾 อุ่นย้อนหลังเก็บแล้ว', d); } catch (e) { log('⚠️ อุ่นย้อนหลัง', d, e.message || e); }
         _warmScan = i + 1; break;
       }
