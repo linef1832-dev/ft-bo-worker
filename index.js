@@ -359,7 +359,7 @@ async function readSheet(date) {
   let j = null, lastTxt = '';
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      const res = await fetch(base + '&_r=' + Date.now() + attempt, { method: 'GET', headers: { 'User-Agent': UA, 'Accept': 'application/json, text/plain, */*' }, signal: AbortSignal.timeout(90000), redirect: 'follow' });
+      const res = await fetch(base + '&_r=' + Date.now() + attempt, { method: 'GET', headers: { 'User-Agent': UA, 'Accept': 'application/json, text/plain, */*' }, signal: AbortSignal.timeout(180000), redirect: 'follow' });
       lastTxt = await res.text();
       try { j = JSON.parse(lastTxt); } catch (e) { j = null; }
     } catch (e) { lastTxt = 'fetch error: ' + (e.message || e); j = null; }
