@@ -374,22 +374,29 @@ async function readSheet(date) {
   putSetting('ft_sheetsum_' + key, { rows: j.rows || [], count: j.count || 0, at: Date.now() }).catch(() => {});
   return j;   // { ok, date, count, rows:[{web,source,staff,user,amount,orderBO,account}] }
 }
-// อุ่นแคชชีตไว้ล่วงหน้า → หน้า FT อ่านจาก Supabase เด้งทันที
-// วันนี้: อุ่นทุกรอบ (90 วิ) · ย้อนหลัง 7 วัน: อุ่นทุกๆ ~10 นาที (วันเก่าไม่ค่อยเปลี่ยน)
+// อุ่นแคชชีตไว้ล่วงหน้าใน Supabase → หน้า FT อ่านเด้งทันที
+// วันนี้+เมื่อวาน: อัปเดตทุกรอบ (เปลี่ยนตลอด) · วันเก่า: ไล่เก็บทีละวันจนครบ แล้วข้าม (นิ่งแล้วไม่อ่านซ้ำ)
+const SHEET_BACKFILL_DAYS = 60;   // เก็บย้อนหลังสูงสุดกี่วัน
 function _dateMinus(ds, n) { const d = new Date(ds + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - n); return d.toISOString().slice(0, 10); }
-let _warmTick = 0;
+let _warmBusy = false, _warmScan = 2;
 async function sheetWarmLoop() {
-  if (!process.env.SHEET_WEBHOOK_URL) return;
-  const today = bangkokNow().date;
-  // วันนี้ + เมื่อวาน: อุ่นทุกรอบ (90 วิ) เพราะดูบ่อยสุด → เด้งทันทีเสมอ
-  try { await readSheet(today); } catch (e) { log('⚠️ อุ่นชีตวันนี้', e.message || e); }
-  try { await readSheet(_dateMinus(today, 1)); } catch (e) {}
-  _warmTick++;
-  if (_warmTick % 7 === 1) {                       // ย้อนหลัง 2–7 วัน ทุกๆ ~10 นาที
-    for (let i = 2; i <= 7; i++) {
-      try { await readSheet(_dateMinus(today, i)); } catch (e) {}
+  if (!process.env.SHEET_WEBHOOK_URL || _warmBusy) return;   // กันรอบชนกัน (วันเต็มอ่านนาน)
+  _warmBusy = true;
+  try {
+    const today = bangkokNow().date;
+    try { await readSheet(today); } catch (e) { log('⚠️ อุ่นชีตวันนี้', e.message || e); }
+    try { await readSheet(_dateMinus(today, 1)); } catch (e) {}   // เมื่อวาน (อาจมีแก้)
+    // ไล่หา "วันเก่าที่ยังไม่มีใน Supabase" แล้วเก็บทีละ 1 วันต่อรอบ (วันเก่าเก็บครั้งเดียวพอ)
+    for (let k = 0; k < SHEET_BACKFILL_DAYS; k++) {
+      const i = 2 + ((_warmScan - 2 + k) % SHEET_BACKFILL_DAYS);
+      const d = _dateMinus(today, i);
+      let have = null; try { have = await getSetting('ft_sheetsum_' + d); } catch (e) {}
+      if (!have || !have.rows) {                  // ยังไม่มี → อ่านมาเก็บ แล้วหยุด (เหลือรอบหน้าค่อยเก็บวันถัดไป)
+        try { await readSheet(d); log('🧾 อุ่นย้อนหลังเก็บแล้ว', d); } catch (e) { log('⚠️ อุ่นย้อนหลัง', d, e.message || e); }
+        _warmScan = i + 1; break;
+      }
     }
-  }
+  } finally { _warmBusy = false; }
 }
 
 // ========================================================
